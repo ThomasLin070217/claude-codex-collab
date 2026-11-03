@@ -1,17 +1,21 @@
-# /collab-review — Quick Cross-Model Code Review
+# /collab-review — Quick Cross-Model Code Review (v2)
 
 Lightweight version of `/collab review`. Use this when you want a fast second opinion on the current diff before committing. Codex acts as a skeptical architect — it's incentivized to find problems, not to be polite.
 
 ## Protocol
 
-1. **Get the diff.** Run `git diff` (unstaged changes) or `git diff --staged` (staged changes). If the user says `/collab-review staged`, use staged. Default: unstaged.
+1. **Get the diff and write it to a file** (v2: 走 ref，不粘贴进 prompt):
+   ```bash
+   mkdir -p ~/Agent/collab/work/claude
+   git diff > ~/Agent/collab/work/claude/diff.txt          # unstaged (default)
+   # git diff --staged > ~/Agent/collab/work/claude/diff.txt  # if user says "staged"
+   wc -l ~/Agent/collab/work/claude/diff.txt
+   ```
 
-2. **Send to Codex as architect:**
+2. **Send Codex the ref, not the diff text:**
    ```bash
    ~/Agent/collab/codex-bridge.sh review architect \
-     "Review this git diff critically. Look for: bugs, edge cases, security vulnerabilities, performance issues, unclear naming, missing tests. Be specific — reference exact lines. If the diff is clean, say so briefly. Here is the diff:
-
-   [paste diff]"
+     "Review the git diff at ~/Agent/collab/work/claude/diff.txt critically. Look for: bugs, edge cases, security vulnerabilities, performance issues, unclear naming, missing tests. Be specific — reference exact lines. If the diff is clean, say so briefly."
    ```
 
 3. **Filter and present findings as a table:**
