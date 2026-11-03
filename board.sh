@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
-#  board.sh — 共享黑板总线 (v3)
+#  board.sh — 共享黑板总线 (v3.1)
 #
 #  v2 → v3 修复（基于 Claude + Codex 双模型评审）：
 #   1. JSON 构造/解析改用 jq（macOS 自带），不再 sed/grep 手抠 —— 修"解析脆弱"
@@ -9,6 +9,13 @@
 #   4. 游标改字节偏移，compact 时显式重置 —— 修"行号游标在截断后失效"
 #   5. 状态机加 lease（租约）+ heartbeat —— 修"崩溃永久卡 running / pid 判活"
 #   6. state/handoff 原子写（tmp + mv）—— 修"读到半截文件"
+#
+#  v3 → v3.1 修复（基于三通道复盘：自建 Codex + subagent Codex + subagent Claude）：
+#   7. 锁改 owner token + 原子 rename 抢占 + 释放 fencing —— 修"双 breaker 同时删锁 / 旧持有者误删"
+#   8. 消息加 seq 单调递增 —— 修"无消息序号"
+#   9. read 加 seen-set 幂等去重 + 半行跳过 —— 修"有 id 不幂等 / 半条日志"
+#  10. state 加状态转换防护（终态不可回 running）—— 修"旧持有者覆盖新状态"
+#  11. atomic_write 加 fsync —— 修"断电丢数据"
 #
 #  依赖：bash + 系统自带命令；jq 优先，缺失时降级并提示。
 #  可作库 source，也可直接执行 `board.sh <command> ...`。
@@ -53,30 +60,53 @@ json_escape() {
 # 生成唯一消息 id：msg-<epoch>-<pid>-<random>
 gen_msg_id() { printf 'msg-%s-%s-%s' "$(date +%s)" "$$" "$RANDOM"; }
 
-# 原子写：tmp + mv（发布即完整）
+# fsync 单个文件（尽力持久化；python3 在 macOS/Linux 均有）
+fsync_file() {
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)" "$1" 2>/dev/null || true
+    fi
+}
+
+# 原子写：tmp + fsync + mv（发布即完整 + 尽力持久化）
 atomic_write() {
     local file="$1" content="$2"
     local tmp="${file}.tmp.$$.$RANDOM"
     printf '%s' "$content" > "$tmp"
+    fsync_file "$tmp"
     mv "$tmp" "$file"
 }
 
-# ── 锁：mkdir 原子锁 + stale 检测 ──────────────────────────────────
+# ── 锁：mkdir 原子锁 + owner token + 原子抢占（fencing）────────────
+# owner token 格式 pid-epoch-rand；释放时校验 token，防误删他人锁；
+# stale 清理用原子 rename（只一个 breaker 能成功），避免双 breaker 同时 rm。
 board_lock() {
+    local token="$$-$(now_epoch)-$RANDOM"
     local i=0
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        # stale 检测：owner pid 已不存在，或锁存在超过 STALE_LOCK_SECONDS
-        if [ -f "$LOCK_DIR/pid" ]; then
-            local opid="" mtime="" now=""
-            opid=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+        local stale=0 owner="" opid="" mtime="" now=""
+        now=$(now_epoch)
+        if [ -f "$LOCK_DIR/owner" ]; then
+            owner=$(cat "$LOCK_DIR/owner" 2>/dev/null || echo "")
+            opid="${owner%%-*}"
             mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
-            now=$(now_epoch)
-            if { [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; } \
-               || { [ -n "$mtime" ] && [ "$mtime" != "0" ] && [ $((now - mtime)) -gt "$STALE_LOCK_SECONDS" ]; }; then
-                echo "[board] 检测到 stale 锁（owner pid=${opid:-?}），强制清理" >&2
-                rm -rf "$LOCK_DIR"
+            # 条件1：owner 进程已死
+            if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then stale=1; fi
+            # 条件2：锁存在超过 STALE_LOCK_SECONDS（兜底；临界区极短，误伤概率低，且靠 token 校验缓解）
+            if [ -n "$mtime" ] && [ "$mtime" != "0" ] && [ $((now - mtime)) -gt "$STALE_LOCK_SECONDS" ]; then stale=1; fi
+        else
+            # 半初始化锁（写 owner 前崩溃）
+            mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
+            if [ -n "$mtime" ] && [ "$mtime" != "0" ] && [ $((now - mtime)) -gt "$STALE_LOCK_SECONDS" ]; then stale=1; fi
+        fi
+        if [ "$stale" = "1" ]; then
+            # 原子抢占：rename 旧锁到唯一名（只有一个 breaker 成功），再删 victim
+            local victim="$LOCK_DIR.stale.$$.$RANDOM"
+            if mv "$LOCK_DIR" "$victim" 2>/dev/null; then
+                echo "[board] 抢占 stale 锁（owner=${owner:-?}）" >&2
+                rm -rf "$victim" 2>/dev/null || true
                 continue
             fi
+            # rename 失败 = 别人已抢/已释放，继续等
         fi
         i=$((i+1))
         if [ $i -gt 200 ]; then
@@ -85,10 +115,23 @@ board_lock() {
         fi
         sleep 0.05
     done
-    printf '%s' "$$" > "$LOCK_DIR/pid"
+    printf '%s' "$token" > "$LOCK_DIR/owner"
+    LOCK_TOKEN="$token"
 }
 
-board_unlock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+board_unlock() {
+    # fencing：只释放自己持有的锁；token 不匹配说明锁已被抢占，拒绝删除
+    if [ -f "$LOCK_DIR/owner" ]; then
+        local cur
+        cur=$(cat "$LOCK_DIR/owner" 2>/dev/null || echo "")
+        if [ -n "${LOCK_TOKEN:-}" ] && [ "$cur" != "$LOCK_TOKEN" ]; then
+            echo "[board] fencing：锁已被抢占，拒绝释放（原 token 失效）" >&2
+            return 0
+        fi
+    fi
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    LOCK_TOKEN=""
+}
 
 # ── init ──────────────────────────────────────────────────────────
 board_init() {
@@ -136,22 +179,25 @@ board_write() {
     [ -n "$from" ] && [ -n "$type" ] || { echo "[board] write 需要 --from 和 --type" >&2; return 1; }
 
     board_init
-    local id line
+    local id
     id=$(gen_msg_id)
+
+    board_lock || return 1
+    # seq 在锁内计算，保证单调递增（append-only + 单写者锁）
+    local seq line
+    seq=$(( $(wc -l < "$BUS_FILE" 2>/dev/null | tr -d ' ') + 1 ))
 
     if has_jq; then
         line=$(jq -cn \
-            --arg id "$id" --arg ts "$(now_iso)" --arg from "$from" --arg to "$to" \
+            --argjson seq "$seq" --arg id "$id" --arg ts "$(now_iso)" --arg from "$from" --arg to "$to" \
             --arg type "$type" --arg task "$task" --arg ref "$ref" --arg summary "$summary" \
-            '{id:$id, ts:$ts, from:$from, to:$to, type:$type, task:$task, ref:$ref, summary:$summary}')
+            '{seq:$seq, id:$id, ts:$ts, from:$from, to:$to, type:$type, task:$task, ref:$ref, summary:$summary}')
     else
         echo "[board] 警告：未找到 jq，JSON 转义降级（建议 brew install jq）" >&2
-        line=$(printf '{"id":"%s","ts":"%s","from":"%s","to":"%s","type":"%s","task":"%s","ref":"%s","summary":"%s"}' \
-            "$(json_escape "$id")" "$(now_iso)" "$(json_escape "$from")" "$(json_escape "$to")" \
+        line=$(printf '{"seq":%s,"id":"%s","ts":"%s","from":"%s","to":"%s","type":"%s","task":"%s","ref":"%s","summary":"%s"}' \
+            "$seq" "$(json_escape "$id")" "$(now_iso)" "$(json_escape "$from")" "$(json_escape "$to")" \
             "$(json_escape "$type")" "$(json_escape "$task")" "$(json_escape "$ref")" "$(json_escape "$summary")")
     fi
-
-    board_lock || return 1
     printf '%s\n' "$line" >> "$BUS_FILE"
     board_unlock
     printf '%s\n' "$id"
@@ -173,6 +219,9 @@ board_read() {
     [ -f "$BUS_FILE" ] || { echo "[board] 总线尚未初始化，先 board init" >&2; return 1; }
 
     local cursor_file="$CURSOR_DIR/$as"
+    local seen_file="$CURSOR_DIR/$as.seen"
+    [ -f "$seen_file" ] || : > "$seen_file"
+
     local offset=0
     [ -f "$cursor_file" ] && offset=$(cat "$cursor_file" 2>/dev/null || echo 0)
     [ "$all" = "1" ] && offset=0
@@ -182,7 +231,18 @@ board_read() {
     [ -z "$size" ] && size=0
 
     if [ "$size" -gt "$offset" ]; then
-        tail -c +$((offset+1)) "$BUS_FILE"
+        # 逐行读：半行/坏行跳过（无法解析 id 的行），seen-set 去重（崩溃重放不重复消费）
+        tail -c +$((offset+1)) "$BUS_FILE" | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            local mid
+            mid=$(printf '%s' "$line" | jq -r '.id // empty' 2>/dev/null || echo "")
+            [ -z "$mid" ] && continue
+            if grep -Fxq "$mid" "$seen_file" 2>/dev/null; then
+                continue
+            fi
+            printf '%s\n' "$line"
+            printf '%s\n' "$mid" >> "$seen_file"
+        done
     fi
 
     board_lock || return 1
@@ -285,11 +345,23 @@ board_state() {
     done
 
     board_init
+    local file="$STATE_DIR/${task_id}.json"
+
+    # fencing：终态（done/failed）不可回 running，防止旧持有者覆盖新状态
+    if [ "$status" = "running" ] && [ -f "$file" ]; then
+        local cur_status
+        cur_status=$(jq -r '.status // ""' "$file" 2>/dev/null || echo "")
+        if [ "$cur_status" = "done" ] || [ "$cur_status" = "failed" ]; then
+            echo "[board] fencing 拒绝：任务已终态（$cur_status），旧持有者不得重启" >&2
+            return 1
+        fi
+    fi
+
     # 租约：running 时设 lease_epoch = now + LEASE_SECONDS；终态清空
     local lease_epoch=""
     [ "$status" = "running" ] && lease_epoch=$(( $(now_epoch) + LEASE_SECONDS ))
 
-    local file="$STATE_DIR/${task_id}.json" content
+    local content
     if has_jq; then
         content=$(jq -cn \
             --arg id "$task_id" --arg status "$status" \
