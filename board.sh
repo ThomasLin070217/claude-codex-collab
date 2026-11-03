@@ -1,31 +1,20 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
-#  board.sh — 共享黑板总线 (v3.1)
+#  board.sh — 共享黑板总线 (v4 · SQLite 事务核心)
 #
-#  v2 → v3 修复（基于 Claude + Codex 双模型评审）：
-#   1. JSON 构造/解析改用 jq（macOS 自带），不再 sed/grep 手抠 —— 修"解析脆弱"
-#   2. 每条消息带唯一 id —— 修"无信封/无法幂等"
-#   3. 锁加 stale 检测（owner pid + 超时强清）—— 修"进程被杀→死锁"
-#   4. 游标改字节偏移，compact 时显式重置 —— 修"行号游标在截断后失效"
-#   5. 状态机加 lease（租约）+ heartbeat —— 修"崩溃永久卡 running / pid 判活"
-#   6. state/handoff 原子写（tmp + mv）—— 修"读到半截文件"
+#  v4：把强一致（消息顺序/消费进度/租约抢占/幂等）下沉到 SQLite(WAL)，
+#      文件层退化为「可读投影」（export 从 SQLite 重建）。
 #
-#  v3 → v3.1 修复（基于三通道复盘：自建 Codex + subagent Codex + subagent Claude）：
-#   7. 锁改 owner token + 原子 rename 抢占 + 释放 fencing —— 修"双 breaker 同时删锁 / 旧持有者误删"
-#   8. 消息加 seq 单调递增 —— 修"无消息序号"
-#   9. read 加 seen-set 幂等去重 + 半行跳过 —— 修"有 id 不幂等 / 半条日志"
-#  10. state 加状态转换防护（终态不可回 running）—— 修"旧持有者覆盖新状态"
-#  11. atomic_write 加 fsync —— 修"断电丢数据"
-#
-#  依赖：bash + 系统自带命令；jq 优先，缺失时降级并提示。
+#  依赖：bash + sqlite3（macOS 自带）。jq 仅用于投影/校验，缺失降级。
 #  可作库 source，也可直接执行 `board.sh <command> ...`。
 # ═══════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 # ── 目录布局 ──────────────────────────────────────────────────────
 COLLAB_DIR="${COLLAB_DIR:-$HOME/Agent/collab}"
+DB="$COLLAB_DIR/board.db"
 BUS_FILE="$COLLAB_DIR/bus/log.ndjson"
-CURSOR_DIR="$COLLAB_DIR/cursor"
+CURSOR_DIR="$COLLAB_DIR/cursor"       # v4 保留目录，但消费进度在 consumption 表
 MEMORY_DIR="$COLLAB_DIR/memory"
 CORE_FILE="$MEMORY_DIR/core.md"
 DECISIONS_FILE="$MEMORY_DIR/decisions.md"
@@ -37,132 +26,125 @@ ARCHIVE_DIR="$COLLAB_DIR/archive"
 CHECKPOINT_DIR="$COLLAB_DIR/checkpoints"
 STATE_DIR="$COLLAB_DIR/state"
 AGENTS_DIR="$COLLAB_DIR/agents"
-LOCK_DIR="$COLLAB_DIR/.lock"
 
-# 锁超过该秒数视为 stale；租约默认 600s（匹配 Codex timeout）
-STALE_LOCK_SECONDS="${STALE_LOCK_SECONDS:-10}"
-LEASE_SECONDS="${LEASE_SECONDS:-600}"
+LEASE_SECONDS="${LEASE_SECONDS:-1800}"
 
 # ── 工具 ──────────────────────────────────────────────────────────
 now_iso() { date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z'; }
 now_epoch() { date +%s; }
-
 has_jq() { command -v jq >/dev/null 2>&1; }
-
-# jq 缺失时的降级转义（尽量别走到这里：macOS 自带 jq）
-json_escape() {
-    local s="$1"
-    s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
-}
+has_sqlite3() { command -v sqlite3 >/dev/null 2>&1; }
 
 # 生成唯一消息 id：msg-<epoch>-<pid>-<random>
 gen_msg_id() { printf 'msg-%s-%s-%s' "$(date +%s)" "$$" "$RANDOM"; }
 
-# fsync 单个文件（尽力持久化；python3 在 macOS/Linux 均有）
-fsync_file() {
-    if command -v python3 >/dev/null 2>&1; then
-        python3 -c "import os,sys; fd=os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)" "$1" 2>/dev/null || true
+# SQL 字符串转义（单引号 → 两单引号）。信任边界：本地 agent 协作，非对抗环境。
+sql_quote() {
+    local s="$1"
+    s="${s//\'/\'\'}"
+    printf "'%s'" "$s"
+}
+
+# db：执行写/更新（-bail 出错即停；.timeout 设 busy 等待，不输出）
+db() {
+    sqlite3 -bail -cmd ".timeout 5000" "$DB" "$1"
+}
+
+# dbq：查询，返回 stdout
+dbq() {
+    sqlite3 -cmd ".timeout 5000" "$DB" "$1"
+}
+
+# payload_hash：ref 指向的文件内容哈希（不可变产物关联）
+payload_hash_of() {
+    local ref="$1"
+    [ -z "$ref" ] && { echo ""; return 0; }
+    local f="$COLLAB_DIR/$ref"
+    if [ -f "$f" ]; then
+        shasum -a 256 "$f" 2>/dev/null | awk '{print $1}' \
+            || sha256sum "$f" 2>/dev/null | awk '{print $1}'
+    else
+        echo ""
     fi
 }
 
-# 原子写：tmp + fsync + mv（发布即完整 + 尽力持久化）
-atomic_write() {
-    local file="$1" content="$2"
-    local tmp="${file}.tmp.$$.$RANDOM"
-    printf '%s' "$content" > "$tmp"
-    fsync_file "$tmp"
-    mv "$tmp" "$file"
-}
-
-# ── 锁：mkdir 原子锁 + owner token + 原子抢占（fencing）────────────
-# owner token 格式 pid-epoch-rand；释放时校验 token，防误删他人锁；
-# stale 清理用原子 rename（只一个 breaker 能成功），避免双 breaker 同时 rm。
-board_lock() {
-    local token="$$-$(now_epoch)-$RANDOM"
-    local i=0
-    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        local stale=0 owner="" opid="" mtime="" now=""
-        now=$(now_epoch)
-        if [ -f "$LOCK_DIR/owner" ]; then
-            owner=$(cat "$LOCK_DIR/owner" 2>/dev/null || echo "")
-            opid="${owner%%-*}"
-            mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
-            # 条件1：owner 进程已死
-            if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then stale=1; fi
-            # 条件2：锁存在超过 STALE_LOCK_SECONDS（兜底；临界区极短，误伤概率低，且靠 token 校验缓解）
-            if [ -n "$mtime" ] && [ "$mtime" != "0" ] && [ $((now - mtime)) -gt "$STALE_LOCK_SECONDS" ]; then stale=1; fi
-        else
-            # 半初始化锁（写 owner 前崩溃）
-            mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null || stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
-            if [ -n "$mtime" ] && [ "$mtime" != "0" ] && [ $((now - mtime)) -gt "$STALE_LOCK_SECONDS" ]; then stale=1; fi
-        fi
-        if [ "$stale" = "1" ]; then
-            # 原子抢占：rename 旧锁到唯一名（只有一个 breaker 成功），再删 victim
-            local victim="$LOCK_DIR.stale.$$.$RANDOM"
-            if mv "$LOCK_DIR" "$victim" 2>/dev/null; then
-                echo "[board] 抢占 stale 锁（owner=${owner:-?}）" >&2
-                rm -rf "$victim" 2>/dev/null || true
-                continue
-            fi
-            # rename 失败 = 别人已抢/已释放，继续等
-        fi
-        i=$((i+1))
-        if [ $i -gt 200 ]; then
-            echo "[board] lock timeout on $LOCK_DIR" >&2
-            return 1
-        fi
-        sleep 0.05
-    done
-    printf '%s' "$token" > "$LOCK_DIR/owner"
-    LOCK_TOKEN="$token"
-}
-
-board_unlock() {
-    # fencing：只释放自己持有的锁；token 不匹配说明锁已被抢占，拒绝删除
-    if [ -f "$LOCK_DIR/owner" ]; then
-        local cur
-        cur=$(cat "$LOCK_DIR/owner" 2>/dev/null || echo "")
-        if [ -n "${LOCK_TOKEN:-}" ] && [ "$cur" != "$LOCK_TOKEN" ]; then
-            echo "[board] fencing：锁已被抢占，拒绝释放（原 token 失效）" >&2
-            return 0
-        fi
-    fi
-    rm -rf "$LOCK_DIR" 2>/dev/null || true
-    LOCK_TOKEN=""
-}
-
-# ── init ──────────────────────────────────────────────────────────
+# ── init：建目录 + SQLite schema ──────────────────────────────────
 board_init() {
     mkdir -p "$(dirname "$BUS_FILE")" "$CURSOR_DIR" "$MEMORY_DIR" \
              "$HANDOFF_DIR" "$WORK_DIR" "$SPECS_DIR" "$ARCHIVE_DIR" \
              "$CHECKPOINT_DIR" "$STATE_DIR" "$AGENTS_DIR"
-    [ -f "$BUS_FILE" ] || : > "$BUS_FILE"
 
-    if [ ! -f "$CORE_FILE" ]; then
-        cat > "$CORE_FILE" <<'CORE'
-# core.md — 常驻层（几 KB，永不膨胀）
+    if ! has_sqlite3; then
+        echo "[board] 错误：需要 sqlite3（macOS 自带 /usr/bin/sqlite3）" >&2
+        return 1
+    fi
 
-> 目标、当前状态、关键约束。人工 + agent 双写。只放「必须永远在上下文里的东西」。
+    sqlite3 "$DB" >/dev/null <<'SQL'
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=FULL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS messages (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           TEXT NOT NULL UNIQUE,
+    ts           INTEGER NOT NULL,
+    from_agent   TEXT NOT NULL,
+    to_agent     TEXT,
+    type         TEXT NOT NULL,
+    task_id      TEXT,
+    ref          TEXT,
+    summary      TEXT,
+    payload_hash TEXT,
+    created_at   INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_messages_task ON messages(task_id, seq);
+CREATE INDEX IF NOT EXISTS idx_messages_to   ON messages(to_agent, seq);
+
+CREATE TABLE IF NOT EXISTS consumption (
+    agent       TEXT PRIMARY KEY,
+    last_seq    INTEGER NOT NULL DEFAULT 0,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id       TEXT PRIMARY KEY,
+    status        TEXT NOT NULL CHECK (status IN ('running','done','failed')),
+    fencing_token INTEGER NOT NULL DEFAULT 0,
+    lease_epoch   INTEGER,
+    owner         TEXT,
+    verdict       TEXT,
+    pid           INTEGER,
+    updated_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    context     TEXT NOT NULL DEFAULT 'general',
+    author      TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    evidence    TEXT,
+    status      TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS memory_dedup ON memory(context, type, text);
+SQL
+
+    # core.md 模板（文件投影仍保留给人看）
+    [ -f "$CORE_FILE" ] || cat > "$CORE_FILE" <<'CORE'
+# core.md — 常驻层（投影，真相在 board.db）
+
+> 目标、当前状态、关键约束。人工 + agent 双写。
 
 ## 目标
-<!-- 本次协作要达成什么 -->
-
 ## 当前状态
-<!-- 进行到哪一步、卡在哪 -->
-
 ## 关键约束
 - 不 commit 到 git（由用户决定）
 - 不碰 .git/ .claude/ CLAUDE.md
 CORE
-    fi
-
-    [ -f "$DECISIONS_FILE" ] || : > "$DECISIONS_FILE"
-    [ -f "$INDEX_FILE" ] || : > "$INDEX_FILE"
 }
 
-# ── write：追加一条消息到总线（jq 构造 + 唯一 id）─────────────────
+# ── write：INSERT 消息（幂等）─────────────────────────────────────
 board_write() {
     local from="" to="" type="" task="" ref="" summary=""
     while [ $# -gt 0 ]; do
@@ -179,31 +161,38 @@ board_write() {
     [ -n "$from" ] && [ -n "$type" ] || { echo "[board] write 需要 --from 和 --type" >&2; return 1; }
 
     board_init
-    local id
+    local id hash
     id=$(gen_msg_id)
+    hash=$(payload_hash_of "$ref")
 
-    board_lock || return 1
-    # seq 在锁内计算，保证单调递增（append-only + 单写者锁）
-    local seq line
-    seq=$(( $(wc -l < "$BUS_FILE" 2>/dev/null | tr -d ' ') + 1 ))
-
-    if has_jq; then
-        line=$(jq -cn \
-            --argjson seq "$seq" --arg id "$id" --arg ts "$(now_iso)" --arg from "$from" --arg to "$to" \
-            --arg type "$type" --arg task "$task" --arg ref "$ref" --arg summary "$summary" \
-            '{seq:$seq, id:$id, ts:$ts, from:$from, to:$to, type:$type, task:$task, ref:$ref, summary:$summary}')
-    else
-        echo "[board] 警告：未找到 jq，JSON 转义降级（建议 brew install jq）" >&2
-        line=$(printf '{"seq":%s,"id":"%s","ts":"%s","from":"%s","to":"%s","type":"%s","task":"%s","ref":"%s","summary":"%s"}' \
-            "$seq" "$(json_escape "$id")" "$(now_iso)" "$(json_escape "$from")" "$(json_escape "$to")" \
-            "$(json_escape "$type")" "$(json_escape "$task")" "$(json_escape "$ref")" "$(json_escape "$summary")")
+    # id UNIQUE 冲突：比对 summary 判断是否同内容（幂等 vs 报错）
+    local existing
+    existing=$(dbq "SELECT summary FROM messages WHERE id=$(sql_quote "$id");" 2>/dev/null || true)
+    if [ -n "$existing" ]; then
+        if [ "$existing" = "$summary" ]; then
+            dbq "SELECT seq FROM messages WHERE id=$(sql_quote "$id");"
+            return 0
+        fi
+        echo "[board] 错误：id 冲突且内容不同（$id）" >&2
+        return 1
     fi
-    printf '%s\n' "$line" >> "$BUS_FILE"
-    board_unlock
-    printf '%s\n' "$id"
+
+    db "INSERT INTO messages (id, ts, from_agent, to_agent, type, task_id, ref, summary, payload_hash)
+        VALUES ($(sql_quote "$id"), $(now_epoch), $(sql_quote "$from"), $(sql_quote "$to"),
+                $(sql_quote "$type"), $(sql_quote "$task"), $(sql_quote "$ref"), $(sql_quote "$summary"),
+                $(sql_quote "$hash"));" || {
+        # 并发下 UNIQUE 冲突：幂等返回已存在的 seq
+        existing=$(dbq "SELECT seq FROM messages WHERE id=$(sql_quote "$id");" 2>/dev/null || true)
+        if [ -n "$existing" ]; then
+            printf '%s\n' "$existing"
+            return 0
+        fi
+        return 1
+    }
+    dbq "SELECT seq FROM messages WHERE id=$(sql_quote "$id");"
 }
 
-# ── read：按字节偏移增量读（游标存字节数，append 场景稳定）────────
+# ── read：事务消费（at-least-once，读+推进同一事务）────────────────
 board_read() {
     local as="" all=0
     while [ $# -gt 0 ]; do
@@ -216,45 +205,189 @@ board_read() {
     [ -n "$as" ] || { echo "[board] read 需要 --as <name>" >&2; return 1; }
 
     board_init
-    [ -f "$BUS_FILE" ] || { echo "[board] 总线尚未初始化，先 board init" >&2; return 1; }
 
-    local cursor_file="$CURSOR_DIR/$as"
-    local seen_file="$CURSOR_DIR/$as.seen"
-    [ -f "$seen_file" ] || : > "$seen_file"
-
-    local offset=0
-    [ -f "$cursor_file" ] && offset=$(cat "$cursor_file" 2>/dev/null || echo 0)
-    [ "$all" = "1" ] && offset=0
-
-    local size
-    size=$(wc -c < "$BUS_FILE" | tr -d ' ')
-    [ -z "$size" ] && size=0
-
-    if [ "$size" -gt "$offset" ]; then
-        # 逐行读：半行/坏行跳过（无法解析 id 的行），seen-set 去重（崩溃重放不重复消费）
-        tail -c +$((offset+1)) "$BUS_FILE" | while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            local mid
-            mid=$(printf '%s' "$line" | jq -r '.id // empty' 2>/dev/null || echo "")
-            [ -z "$mid" ] && continue
-            if grep -Fxq "$mid" "$seen_file" 2>/dev/null; then
-                continue
-            fi
-            printf '%s\n' "$line"
-            printf '%s\n' "$mid" >> "$seen_file"
-        done
+    if [ "$all" = "1" ]; then
+        # 调试/重建：读全部，不推进游标
+        dbq "SELECT json_object('seq',seq,'id',id,'ts',ts,'from',from_agent,'to',to_agent,'type',type,'task',task_id,'ref',ref,'summary',summary)
+             FROM messages ORDER BY seq;"
+        return 0
     fi
 
-    board_lock || return 1
-    printf '%s' "$size" > "$cursor_file"
-    board_unlock
+    # 事务：读 last_seq 之后 + 推进 last_seq（崩溃回滚 → 不丢不重）
+    dbq "BEGIN IMMEDIATE;
+         SELECT json_object('seq',seq,'id',id,'ts',ts,'from',from_agent,'to',to_agent,'type',type,'task',task_id,'ref',ref,'summary',summary)
+         FROM messages
+         WHERE seq > COALESCE((SELECT last_seq FROM consumption WHERE agent=$(sql_quote "$as")), 0)
+         ORDER BY seq;
+         INSERT INTO consumption(agent,last_seq,updated_at)
+         VALUES($(sql_quote "$as"), (SELECT COALESCE(MAX(seq),0) FROM messages), $(now_epoch))
+         ON CONFLICT(agent) DO UPDATE SET last_seq=excluded.last_seq, updated_at=excluded.updated_at;
+         COMMIT;"
 }
 
-# ── handoff：写交接文件（原子写）───────────────────────────────────
+# ── start：启动新任务（token=1），返回 token ───────────────────────
+board_start() {
+    local task_id="${1:-}"
+    [ -n "$task_id" ] || { echo "[board] start 需要 <task_id>" >&2; return 1; }
+    board_init
+    local owner="${2:-${BOARD_OWNER:-unknown}}"
+    local lease=$(( $(now_epoch) + LEASE_SECONDS ))
+
+    local existing
+    existing=$(dbq "SELECT status FROM tasks WHERE task_id=$(sql_quote "$task_id");" 2>/dev/null || true)
+    if [ -n "$existing" ]; then
+        case "$existing" in
+            running)
+                # 已在运行：幂等返回现有 token
+                dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
+                return 0 ;;
+            done)
+                echo "[board] 拒绝：任务已 done，不可重启（fencing）" >&2; return 1 ;;
+            failed)
+                # 失败允许重试：重置 running，token 递增
+                db "UPDATE tasks SET status='running', fencing_token=fencing_token+1, lease_epoch=$lease,
+                    owner=$(sql_quote "$owner"), pid=$$, updated_at=$(now_epoch)
+                    WHERE task_id=$(sql_quote "$task_id");"
+                dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
+                return 0 ;;
+        esac
+    fi
+
+    # 不存在：INSERT（token=1）
+    db "INSERT INTO tasks(task_id,status,fencing_token,lease_epoch,owner,pid,updated_at)
+        VALUES($(sql_quote "$task_id"),'running',1,$lease,$(sql_quote "$owner"),$$,$(now_epoch));"
+    dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
+}
+
+# ── claim：抢占孤儿任务（lease 过期），RETURNING 新 token ──────────
+board_claim() {
+    local task_id="${1:-}"
+    [ -n "$task_id" ] || { echo "[board] claim 需要 <task_id>" >&2; return 1; }
+    board_init
+    local owner="${2:-${BOARD_OWNER:-unknown}}"
+    local lease=$(( $(now_epoch) + LEASE_SECONDS ))
+    db "UPDATE tasks
+        SET status='running', fencing_token=fencing_token+1, lease_epoch=$lease,
+            owner=$(sql_quote "$owner"), pid=$$, updated_at=$(now_epoch)
+        WHERE task_id=$(sql_quote "$task_id") AND status='running' AND lease_epoch < $(now_epoch)
+        RETURNING fencing_token;"
+}
+
+# ── state：提交终态（CAS：token 匹配 + lease 未过期）───────────────
+board_state() {
+    local task_id="${1:-}"; local status="${2:-}"
+    [ -n "$task_id" ] && [ -n "$status" ] || { echo "[board] state 需要 <task_id> <done|failed>" >&2; return 1; }
+
+    local verdict="" token="" pid=""
+    shift 2 || true
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --verdict) verdict="$2"; shift 2 ;;
+            --token) token="$2"; shift 2 ;;
+            --pid) pid="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    # running 别名 → start
+    if [ "$status" = "running" ]; then
+        board_start "$task_id" "${BOARD_OWNER:-unknown}"
+        return $?
+    fi
+
+    [ "$status" = "done" ] || [ "$status" = "failed" ] || { echo "[board] state 状态必须是 done|failed" >&2; return 1; }
+
+    board_init
+    local now; now=$(now_epoch)
+
+    if [ -n "$token" ]; then
+        # fencing CAS：token 匹配 + 当前 running + lease 未过期（UPDATE + changes() 同连接）
+        local affected
+        affected=$(sqlite3 -bail -cmd ".timeout 5000" "$DB" "
+            UPDATE tasks SET status='$status', fencing_token=fencing_token+1, verdict=$(sql_quote "$verdict"), updated_at=$now
+            WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token AND status='running' AND lease_epoch >= $now;
+            SELECT changes();")
+        if [ "$affected" != "1" ]; then
+            echo "[board] fencing 拒绝：token 不匹配或已失权（旧持有者）" >&2
+            return 1
+        fi
+    else
+        # 无 token：宽松提交（兼容旧调用，仅限无竞争场景）
+        db "UPDATE tasks SET status='$status', fencing_token=fencing_token+1, verdict=$(sql_quote "$verdict"), updated_at=$now
+            WHERE task_id=$(sql_quote "$task_id") AND status='running';"
+    fi
+}
+
+# ── heartbeat：续租（带 token + lease 未过期）──────────────────────
+board_heartbeat() {
+    local task_id="${1:-}"
+    [ -n "$task_id" ] || { echo "[board] heartbeat 需要 <task_id>" >&2; return 1; }
+    shift || true
+    local token=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --token) token="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    board_init
+    local lease now; lease=$(( $(now_epoch) + LEASE_SECONDS )); now=$(now_epoch)
+    if [ -n "$token" ]; then
+        db "UPDATE tasks SET lease_epoch=$lease, updated_at=$now
+            WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token AND status='running' AND lease_epoch >= $now;"
+    else
+        db "UPDATE tasks SET lease_epoch=$lease, updated_at=$now
+            WHERE task_id=$(sql_quote "$task_id") AND status='running' AND lease_epoch >= $now;"
+    fi
+}
+
+# ── check：判活（派生 orphaned）────────────────────────────────────
+board_check() {
+    local task_id="${1:-}"
+    [ -n "$task_id" ] || { echo "[board] check 需要 <task_id>" >&2; return 1; }
+    board_init
+    local row status lease token
+    row=$(dbq "SELECT status, COALESCE(lease_epoch,0), fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");" 2>/dev/null || true)
+    [ -z "$row" ] && { echo "unknown"; return 0; }
+    status=$(echo "$row" | cut -d'|' -f1)
+    lease=$(echo "$row" | cut -d'|' -f2)
+    token=$(echo "$row" | cut -d'|' -f3)
+    if [ "$status" = "running" ] && [ -n "$lease" ] && [ "$lease" != "0" ] && [ "$(now_epoch)" -gt "$lease" ]; then
+        echo "orphaned token=$token"
+    else
+        echo "$status"
+    fi
+}
+
+# ── remember：语义记忆（按 context 去重）───────────────────────────
+board_remember() {
+    local author="" type="decision" text="" evidence="" status="proposed" context="general"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --author) author="$2"; shift 2 ;;
+            --type) type="$2"; shift 2 ;;
+            --text) text="$2"; shift 2 ;;
+            --evidence) evidence="$2"; shift 2 ;;
+            --status) status="$2"; shift 2 ;;
+            --context) context="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$author" ] && [ -n "$text" ] || { echo "[board] remember 需要 --author 和 --text" >&2; return 1; }
+
+    board_init
+    if db "INSERT INTO memory(context,author,type,text,evidence,status,created_at)
+           VALUES($(sql_quote "$context"),$(sql_quote "$author"),$(sql_quote "$type"),$(sql_quote "$text"),$(sql_quote "$evidence"),$(sql_quote "$status"),$(now_epoch));" 2>/dev/null; then
+        echo "[board] 已写入语义记忆：${text:0:60}"
+    else
+        echo "[board] 已存在相同条目，跳过：${text:0:60}"
+    fi
+}
+
+# ── handoff：写交接文件（文件产物）+ 记消息 ────────────────────────
 board_handoff() {
     local task_id="${1:-}"; shift || true
     [ -n "$task_id" ] || { echo "[board] handoff 需要 <task_id>" >&2; return 1; }
-
     local from="" status="" outcome="" artifacts="" risks="" next=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -280,186 +413,57 @@ board_handoff() {
     [ -n "$artifacts" ] && content+=$'\n\n## 产物\n'"$artifacts"
     [ -n "$risks" ] && content+=$'\n\n## 遗留风险\n'"$risks"
     [ -n "$next" ] && content+=$'\n\n## 下一步\n'"$next"
-
-    atomic_write "$file" "$content"
+    printf '%s' "$content" > "$file"
     echo "[board] handoff 已写：$file"
 
     board_write --from "$from" --type handoff --task "$task_id" \
-        --ref "handoff/${task_id}.md" \
-        --summary "${outcome:-交接完成}" >/dev/null || true
+        --ref "handoff/${task_id}.md" --summary "${outcome:-交接完成}" >/dev/null || true
 }
 
-# ── remember：写语义层（锁保护 + 去重）─────────────────────────────
-board_remember() {
-    local author="" type="decision" text="" evidence="" status="proposed"
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --author) author="$2"; shift 2 ;;
-            --type) type="$2"; shift 2 ;;
-            --text) text="$2"; shift 2 ;;
-            --evidence) evidence="$2"; shift 2 ;;
-            --status) status="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-    [ -n "$author" ] && [ -n "$text" ] || { echo "[board] remember 需要 --author 和 --text" >&2; return 1; }
-
+# ── export：SQLite → 文件投影（只读，可重建）───────────────────────
+board_export() {
     board_init
-    board_lock || return 1
+    mkdir -p "$(dirname "$BUS_FILE")" "$STATE_DIR" "$MEMORY_DIR"
 
-    if grep -Fq "文本: $text" "$DECISIONS_FILE" 2>/dev/null; then
-        echo "[board] 已存在相同条目，跳过（避免重复）：${text:0:60}"
-        board_unlock
-        return 0
-    fi
+    # bus/log.ndjson（消息投影）
+    dbq "SELECT json_object('seq',seq,'id',id,'ts',ts,'from',from_agent,'to',to_agent,'type',type,'task',task_id,'ref',ref,'summary',summary)
+         FROM messages ORDER BY seq;" > "$BUS_FILE"
 
-    {
-        echo
-        echo "## ${type}: ${text:0:80}"
-        echo "- 文本: $text"
-        echo "- 作者: $author"
-        echo "- 时间: $(now_iso)"
-        [ -n "$evidence" ] && echo "- 依据: $evidence"
-        echo "- 状态: $status"
-    } >> "$DECISIONS_FILE"
-    printf '%s\t%s\t%s\t%s\n' "$(now_iso)" "$author" "$type" "$text" >> "$INDEX_FILE"
-
-    board_unlock
-    echo "[board] 已写入语义记忆：${text:0:60}"
-}
-
-# ── state：结构化状态（jq 构造 + lease + 原子写）───────────────────
-# board state <task_id> <running|done|failed> [--verdict v] [--pid n]
-board_state() {
-    local task_id="${1:-}"; local status="${2:-}"
-    [ -n "$task_id" ] && [ -n "$status" ] || { echo "[board] state 需要 <task_id> <status>" >&2; return 1; }
-
-    local verdict="" pid=""
-    shift 2 || true
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --verdict) verdict="$2"; shift 2 ;;
-            --pid) pid="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-
-    board_init
-    local file="$STATE_DIR/${task_id}.json"
-
-    # fencing：终态（done/failed）不可回 running，防止旧持有者覆盖新状态
-    if [ "$status" = "running" ] && [ -f "$file" ]; then
-        local cur_status
-        cur_status=$(jq -r '.status // ""' "$file" 2>/dev/null || echo "")
-        if [ "$cur_status" = "done" ] || [ "$cur_status" = "failed" ]; then
-            echo "[board] fencing 拒绝：任务已终态（$cur_status），旧持有者不得重启" >&2
-            return 1
+    # state/*.json（任务状态投影）
+    local f
+    while IFS='|' read -r task_id status token verdict lease owner; do
+        f="$STATE_DIR/${task_id}.json"
+        if has_jq; then
+            jq -cn --arg id "$task_id" --arg status "$status" --argjson token "$token" \
+                --arg verdict "$verdict" --arg lease "$lease" --arg owner "$owner" \
+                '{id:$id,status:$status,fencing_token:$token,verdict:$verdict,lease_epoch:$lease,owner:$owner}' > "$f"
+        else
+            printf '{"id":"%s","status":"%s","fencing_token":%s,"verdict":"%s","lease_epoch":"%s","owner":"%s"}\n' \
+                "$task_id" "$status" "$token" "$verdict" "$lease" "$owner" > "$f"
         fi
-    fi
+    done < <(dbq "SELECT task_id,status,fencing_token,COALESCE(verdict,''),COALESCE(lease_epoch,0),COALESCE(owner,'') FROM tasks;")
 
-    # 租约：running 时设 lease_epoch = now + LEASE_SECONDS；终态清空
-    local lease_epoch=""
-    [ "$status" = "running" ] && lease_epoch=$(( $(now_epoch) + LEASE_SECONDS ))
+    # memory/decisions.md（语义记忆投影）
+    dbq "SELECT '## '||type||': '||substr(text,1,80)||char(10)||'- 文本: '||text||char(10)||'- 作者: '||author||char(10)||'- 状态: '||COALESCE(status,'')||char(10)
+         FROM memory ORDER BY id;" > "$DECISIONS_FILE"
 
-    local content
-    if has_jq; then
-        content=$(jq -cn \
-            --arg id "$task_id" --arg status "$status" \
-            --argjson pid "${pid:-0}" --arg verdict "$verdict" \
-            --arg lease_epoch "$lease_epoch" --arg updated "$(now_iso)" \
-            '{id:$id, status:$status, pid:$pid, verdict:$verdict, lease_epoch:$lease_epoch, updated:$updated}')
-    else
-        content=$(printf '{"id":"%s","status":"%s","pid":%s,"verdict":"%s","lease_epoch":"%s","updated":"%s"}' \
-            "$(json_escape "$task_id")" "$(json_escape "$status")" "${pid:-0}" \
-            "$(json_escape "$verdict")" "$lease_epoch" "$(now_iso)")
-    fi
-    atomic_write "$file" "$content"
+    echo "[board] export 完成：投影已从 board.db 重建"
 }
 
-# ── heartbeat：续租（running 任务的心跳）────────────────────────────
-board_heartbeat() {
-    local task_id="${1:-}"
-    [ -n "$task_id" ] || { echo "[board] heartbeat 需要 <task_id>" >&2; return 1; }
-    board_init
-    local file="$STATE_DIR/${task_id}.json"
-    [ -f "$file" ] || { echo "[board] 无状态文件：$task_id" >&2; return 1; }
-
-    local lease_epoch=$(( $(now_epoch) + LEASE_SECONDS ))
-    if has_jq; then
-        jq --arg le "$lease_epoch" --arg ts "$(now_iso)" \
-            '.lease_epoch = $le | .updated = $ts' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
-    else
-        echo "[board] 警告：heartbeat 需要 jq" >&2
-        return 1
-    fi
-}
-
-# ── check：判活（弃 pid，靠 lease）─────────────────────────────────
-# board check <task_id>  → 输出 running|done|failed|orphaned|unknown
-board_check() {
-    local task_id="${1:-}"
-    [ -n "$task_id" ] || { echo "[board] check 需要 <task_id>" >&2; return 1; }
-    board_init
-    local file="$STATE_DIR/${task_id}.json"
-    [ -f "$file" ] || { echo "unknown"; return 0; }
-
-    local status lease
-    if has_jq; then
-        status=$(jq -r '.status // "unknown"' "$file" 2>/dev/null || echo unknown)
-        lease=$(jq -r '.lease_epoch // ""' "$file" 2>/dev/null || echo "")
-    else
-        status=$(grep -o '"status":"[^"]*"' "$file" | head -1 | cut -d'"' -f4)
-        lease=$(grep -o '"lease_epoch":"[^"]*"' "$file" | head -1 | cut -d'"' -f4)
-    fi
-
-    if [ "$status" = "running" ] && [ -n "$lease" ] && [ "$lease" != "" ]; then
-        if [ "$(now_epoch)" -gt "$lease" ]; then
-            echo "orphaned"
-            return 0
-        fi
-    fi
-    echo "$status"
-}
-
-# ── compact：折叠旧日志到 archive + checkpoint，重置游标 ───────────
-board_compact() {
-    board_init
-    board_lock || return 1
-    local ts
-    ts=$(date +%s)
-    if [ -s "$BUS_FILE" ]; then
-        mkdir -p "$ARCHIVE_DIR" "$CHECKPOINT_DIR"
-        mv "$BUS_FILE" "$ARCHIVE_DIR/log-${ts}.ndjson"
-        : > "$BUS_FILE"
-        # 所有 agent 游标重置（日志已截断，字节偏移从 0 重新计）
-        rm -f "$CURSOR_DIR"/* 2>/dev/null || true
-        # 写 checkpoint 快照（当前世界状态摘要，供恢复）
-        {
-            echo "# Checkpoint $(now_iso)"
-            echo "- 归档: archive/log-${ts}.ndjson"
-            echo "- 语义记忆条数: $(grep -c '^## ' "$DECISIONS_FILE" 2>/dev/null || echo 0)"
-        } > "$CHECKPOINT_DIR/${ts}.md"
-        echo "[board] 已 compact：旧日志归档到 archive/log-${ts}.ndjson，游标已重置"
-    else
-        echo "[board] 总列为空，无需 compact"
-    fi
-    board_unlock
-}
-
-# ── search ─────────────────────────────────────────────────────────
+# ── search：检索（优先 SQLite LIKE，回退 grep 投影）────────────────
 board_search() {
     board_init
-    local files=()
-    [ -f "$BUS_FILE" ] && files+=("$BUS_FILE")
-    [ -f "$DECISIONS_FILE" ] && files+=("$DECISIONS_FILE")
-    [ -f "$INDEX_FILE" ] && files+=("$INDEX_FILE")
-    if [ ${#files[@]} -eq 0 ]; then
-        echo "[board] 无数据可检索"; return 0
-    fi
-    if command -v rg >/dev/null 2>&1; then
-        rg -i "$@" "${files[@]}" || echo "[board] 无匹配"
+    local kw="${1:-}"
+    [ -n "$kw" ] || { echo "[board] search 需要关键词" >&2; return 1; }
+    local hits
+    hits=$(dbq "SELECT 'msg seq='||seq||': '||summary FROM messages WHERE summary LIKE '%'||$(sql_quote "$kw")||'%'
+                UNION ALL
+                SELECT 'memory: '||text FROM memory WHERE text LIKE '%'||$(sql_quote "$kw")||'%'
+                LIMIT 50;" 2>/dev/null || true)
+    if [ -n "$hits" ]; then
+        echo "$hits"
     else
-        grep -i -H -n "$1" "${files[@]}" 2>/dev/null || echo "[board] 无匹配"
+        echo "[board] 无匹配"
     fi
 }
 
@@ -485,30 +489,33 @@ board_main() {
         init)       shift; board_init "$@" ;;
         write)      shift; board_write "$@" ;;
         read)       shift; board_read "$@" ;;
-        handoff)    shift; board_handoff "$@" ;;
-        remember)   shift; board_remember "$@" ;;
+        start)      shift; board_start "$@" ;;
+        claim)      shift; board_claim "$@" ;;
         state)      shift; board_state "$@" ;;
         heartbeat)  shift; board_heartbeat "$@" ;;
         check)      shift; board_check "$@" ;;
-        compact)    shift; board_compact "$@" ;;
+        remember)   shift; board_remember "$@" ;;
+        handoff)    shift; board_handoff "$@" ;;
+        export)     shift; board_export "$@" ;;
         search)     shift; board_search "$@" ;;
         agents)     shift; board_agents "$@" ;;
         help|"")
             cat <<'HELP'
-board.sh <command> [args]
+board.sh <command> [args]   (v4 · SQLite)
 
-  init                            初始化目录 + 分层记忆
-  write  --from X --to Y --type T --task ID [--ref P] [--summary S]
-                                  追加消息（jq 构造，返回唯一 id）
-  read   --as NAME [--all]        增量读总线（字节偏移游标）
-  handoff <task_id> --from X [--status done --outcome O --artifacts A --risks R --next N]
-  remember --author X --text T [--type decision --evidence P --status confirmed]
-  state  <task_id> <running|done|failed> [--verdict V --pid N]
-  heartbeat <task_id>             续租（刷新 lease）
-  check   <task_id>               判活：running|done|failed|orphaned|unknown
-  compact                         折叠旧日志到 archive，重置游标
-  search <kw...>                  检索总线 + 语义记忆
-  agents                          列出名片卡
+  init                          建 SQLite schema + 目录
+  write  --from X --to Y --type T --task ID [--ref P] [--summary S]   (返回 seq)
+  read   --as NAME [--all]      事务消费（读+推进游标）
+  start  <task_id> [owner]      启动任务（token=1），返回 token
+  claim  <task_id> [owner]      抢占孤儿任务（lease 过期），RETURNING 新 token
+  state  <task_id> <done|failed> [--token T] [--verdict V]   (fencing CAS 提交)
+  heartbeat <task_id> [--token T]
+  check  <task_id>              判活：running|done|failed|orphaned|unknown
+  remember --author X --text T [--context C --type T --status S]
+  handoff <task_id> --from X [--outcome O ...]
+  export                        从 SQLite 重建文件投影（只读）
+  search <kw>                   SQLite LIKE 检索
+  agents                        列出名片卡
 HELP
             ;;
         *) echo "[board] 未知命令: $1" >&2; return 1 ;;
