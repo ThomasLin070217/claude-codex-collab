@@ -16,20 +16,25 @@ export COLLAB_DIR
 
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/board.sh"
+MAX_INFLIGHT_PER_AGENT="${MAX_INFLIGHT_PER_AGENT:-1}"
+export MAX_INFLIGHT_PER_AGENT
+is_int "$MAX_INFLIGHT_PER_AGENT" && [ "$MAX_INFLIGHT_PER_AGENT" -gt 0 ] || exit 1
+board_init
 
 # ── 能力路由：读名片卡，按 skill 匹配 job type；只匹配「在线」agent ─
 match_agent() {
     local type="$1" f name online
     for f in "$AGENTS_DIR"/*.md; do
         [ -f "$f" ] || continue
-        name=$(grep -m1 '^name:' "$f" 2>/dev/null | sed 's/^name:[[:space:]]*//')
+        name=$(grep -m1 '^name:' "$f" 2>/dev/null | sed 's/^name:[[:space:]]*//' || true)
         [ -n "$name" ] || name=$(basename "$f" .md)
         # 跳过协调者/人类自己
         case "$name" in scheduler|lead|human) continue ;; esac
         # 简单匹配：名片卡 skills 行包含该 type（固定字符串）
         if grep -m1 '^skills:' "$f" 2>/dev/null | grep -qF "$type"; then
             # 只匹配在线 agent（agents 表 expires > now）
-            online=$(dbq "SELECT COUNT(*) FROM agents WHERE agent=$(sql_quote "$name") AND expires > $(now_epoch);" 2>/dev/null || echo 0)
+            online=$(dbq "SELECT COUNT(*) FROM agents WHERE agent=$(sql_quote "$name") AND expires > $(now_epoch)
+                AND (SELECT COUNT(*) FROM jobs WHERE assigned_to=$(sql_quote "$name") AND status='running') < $MAX_INFLIGHT_PER_AGENT;" 2>/dev/null || echo 0)
             if [ "$online" = "1" ]; then
                 echo "$name"; return 0
             fi
@@ -54,7 +59,7 @@ run() {
 
         # 2. 找 ready job
         local ready job_id type
-        ready=$(dbq "SELECT job_id||'|'||type FROM jobs WHERE status='ready' ORDER BY priority DESC, created_at ASC LIMIT 1;" 2>/dev/null || true)
+        ready=$(dbq "SELECT job_id||'|'||type FROM jobs WHERE status='ready' ORDER BY priority DESC, created_at ASC;" 2>/dev/null || true)
 
         if [ -z "$ready" ]; then
             # 无 ready：判断是否还有 running 或 pending（继续等），否则结束
@@ -69,28 +74,18 @@ run() {
             continue
         fi
 
-        job_id="${ready%%|*}"
-        type="${ready##*|}"
-
-        # 3. 能力路由（只匹配在线 agent）
-        local agent
-        agent=$(match_agent "$type")
-        if [ -z "$agent" ]; then
-            # 无在线 agent 能做该类型：等待（不卡死，继续下一轮）
-            sleep 1
-            continue
-        fi
-
-        # 4. 认领（fencing token）+ 发租约消息
-        local token
-        token=$(board_job_claim --id "$job_id" --agent "$agent" 2>/dev/null | tail -1)
-        if [ -z "$token" ]; then
-            echo "[scheduler] 认领失败 $job_id，跳过"
-            continue
-        fi
-        board_write --from scheduler --to "$agent" --type task --task "$job_id" \
-            --summary "执行 job $job_id (type=$type) token=$token" >/dev/null 2>&1 || true
-        echo "[scheduler] 派发 $job_id (type=$type) → $agent (token=$token)"
+        local agent token dispatched=0
+        while IFS='|' read -r job_id type; do
+            [ -n "$job_id" ] || continue
+            agent=$(match_agent "$type")
+            [ -n "$agent" ] || continue
+            # job-claim also writes the durable message in the same transaction.
+            if token=$(board_job_claim --id "$job_id" --agent "$agent"); then
+                echo "[scheduler] 派发 $job_id (type=$type) → $agent (token=$token)"
+                dispatched=1
+            fi
+        done <<< "$ready"
+        if [ "$dispatched" = 0 ]; then sleep 1; fi
     done
 
     # 最终状态

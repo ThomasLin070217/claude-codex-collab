@@ -17,16 +17,8 @@ REPORTS_DIR="$COLLAB_DIR/reports"
 LEASE_SECONDS="${LEASE_SECONDS:-1800}"
 export LEASE_SECONDS
 
-# 引入黑板总线（同目录 board.sh）；缺失时降级为纯直连（不致命）。
-if [ -f "$SCRIPT_DIR/board.sh" ]; then
-    # shellcheck disable=SC1091
-    source "$SCRIPT_DIR/board.sh"
-else
-    echo "[codex-bridge] 未找到 board.sh，跳过总线集成（仅直连 Codex）" >&2
-    board_write() { :; }
-    board_state() { :; }
-    board_handoff() { :; }
-fi
+# Task execution requires the fencing implementation; never silently bypass it.
+source "$SCRIPT_DIR/board.sh"
 
 # ── Auto-detect Codex CLI ─────────────────────────────────
 detect_codex() {
@@ -199,15 +191,20 @@ main() {
     local skip_next=false
     for arg in "$@"; do
         if $skip_next; then
+            task_id="$arg"
+            [ -n "$task_id" ] || { echo "--task-id requires a value" >&2; return 1; }
             skip_next=false
             continue
         fi
         case "$arg" in
-            --task-id=*) task_id="${arg#*=}" ;;
+            --task-id=*) task_id="${arg#*=}"; [ -n "$task_id" ] || return 1 ;;
             --task-id) skip_next=true ;;
             *) filtered+=("$arg") ;;
         esac
     done
+
+    if $skip_next; then echo "--task-id requires a value" >&2; return 1; fi
+    if [ -n "$task_id" ]; then valid_task_id "$task_id" || return 1; fi
 
     local mode="${filtered[0]:-}"
     local role="${filtered[1]:-}"
@@ -258,7 +255,10 @@ $prompt" ;;
     # fencing：启动拿 token（提交终态时 CAS 用）
     local TOKEN=""
     if [ -n "$task_id" ]; then
-        TOKEN=$(board_start "$task_id" codex 2>/dev/null || echo "")
+        # Each invocation is a distinct executor, so concurrent bridges cannot share a grant.
+        TOKEN=$(board_start "$task_id" "codex-$$-$RANDOM") || return 1
+        is_int "$TOKEN" && [ "$TOKEN" -gt 0 ] || return 1
+        board_guard "$task_id" --token "$TOKEN" || return 1
     fi
 
     local sandbox="read-only"
@@ -274,11 +274,12 @@ $prompt" ;;
             ;;
     esac
 
-    run_codex "${codex_args[@]}"
-    local rc=$?
+    local rc=0
+    run_codex "${codex_args[@]}" || rc=$?
 
     # 保存输出（供后续 review 读，避免 prompt 粘贴）
     if [ -n "$task_id" ]; then
+        board_guard "$task_id" --token "$TOKEN" || return 1
         mkdir -p "$OUTPUT_DIR"
         printf '%s\n' "$CODEX_STDOUT" > "$OUTPUT_DIR/${task_id}.txt"
     fi
@@ -288,7 +289,7 @@ $prompt" ;;
     verdict=$(extract_verdict)
 
     # 提取结构化 handoff（builder 会输出 JSON），写交接文件（只回传结论）
-    if [ -n "$task_id" ] && [ "$mode" = "build" ]; then
+    if [ -n "$task_id" ] && [ "$mode" = "build" ] && [ "$rc" -eq 0 ]; then
         local handoff_json
         handoff_json=$(extract_handoff_json)
         if [ -n "$handoff_json" ]; then

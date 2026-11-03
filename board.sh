@@ -53,6 +53,14 @@ is_int() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+# IDs used in filenames and line-oriented routing must remain a single component.
+valid_task_id() {
+    case "$1" in
+        ''|.|..|*/*|*\\*|*'|'*|*$'\n'*|*$'\r'*)
+            echo "[board] invalid task_id: expected a single path component" >&2; return 1 ;;
+    esac
+}
+
 # db：执行写/更新（PRAGMA busy_timeout 更可靠；awk 滤掉其返回值 "5000"）
 # 注意用 PIPESTATUS 保留 sqlite3 的真实退出码，供 || 错误处理。
 db() {
@@ -62,7 +70,7 @@ db() {
 
 # dbq：查询，返回 stdout（同样滤掉 PRAGMA 返回值）
 dbq() {
-    sqlite3 "$DB" "PRAGMA busy_timeout=5000; $1" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}'
+    sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000; $1" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}'
 }
 
 # payload_hash：ref 指向的文件内容哈希（不可变产物关联）
@@ -89,7 +97,7 @@ board_init() {
         return 1
     fi
 
-    sqlite3 "$DB" >/dev/null 2>&1 <<'SQL'
+    sqlite3 -bail "$DB" >/dev/null <<'SQL' || return 1
 PRAGMA busy_timeout=5000;
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
@@ -145,6 +153,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     type          TEXT NOT NULL,                       -- 能力类型（plan/execute/review/...）
     payload       TEXT,                                -- 任务内容
     deps          TEXT NOT NULL DEFAULT '',            -- 依赖的 job_id，逗号分隔（空=无依赖）
+    owner_session TEXT,
     assigned_to   TEXT,                                -- 指派的 agent
     status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','ready','running','done','failed','dead')),
     priority      INTEGER NOT NULL DEFAULT 0,
@@ -153,6 +162,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     fencing_token INTEGER NOT NULL DEFAULT 0,          -- 执行权（fencing）
     lease_epoch   INTEGER,
     verdict       TEXT,
+    result        TEXT,                                -- 幂等结果（--effect），done 时由触发器写入 job_effects
     created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     updated_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
@@ -165,6 +175,25 @@ CREATE TABLE IF NOT EXISTS job_deps (
     PRIMARY KEY (job_id, dep_id)
 );
 
+-- Abort the entire creation transaction, including the new job, on a cycle.
+CREATE TRIGGER IF NOT EXISTS job_deps_acyclic BEFORE INSERT ON job_deps
+BEGIN
+    SELECT RAISE(ROLLBACK, 'job dependency cycle') WHERE NEW.job_id=NEW.dep_id
+      OR EXISTS (
+        WITH RECURSIVE ancestors(id) AS (
+          SELECT NEW.dep_id
+          UNION
+          SELECT d.dep_id FROM job_deps d JOIN ancestors a ON d.job_id=a.id
+        ) SELECT 1 FROM ancestors WHERE id=NEW.job_id
+      );
+END;
+
+-- The demo effect is stored atomically with completion; job_id is its stable idempotency key.
+CREATE TABLE IF NOT EXISTS job_effects (
+    job_id TEXT PRIMARY KEY,
+    result TEXT NOT NULL
+);
+
 -- agent 健康表（区分「能力声明」vs「在线状态」；scheduler 只派发给在线 agent）
 CREATE TABLE IF NOT EXISTS agents (
     agent      TEXT PRIMARY KEY,
@@ -172,7 +201,58 @@ CREATE TABLE IF NOT EXISTS agents (
     expires    INTEGER NOT NULL,          -- 健康到期（epoch），到期即视为离线
     updated_at INTEGER NOT NULL
 );
+
+-- 认领即派发：UPDATE jobs（ready→running）后原子插入派发消息。
+-- 用触发器而非多语句事务，因为 sqlite3 CLI 的多语句事务在中间出错时回滚不可靠；
+-- 触发器内失败会连认领一起回滚（语句级原子）。
+CREATE TRIGGER IF NOT EXISTS dispatch_on_claim
+AFTER UPDATE OF status ON jobs
+WHEN NEW.status='running' AND OLD.status='ready'
+BEGIN
+    INSERT INTO messages(id,ts,from_agent,to_agent,type,task_id,summary)
+    VALUES('dispatch:'||NEW.job_id||':'||NEW.fencing_token,
+           strftime('%s','now'), 'scheduler', NEW.assigned_to, 'task', NEW.job_id,
+           'token='||NEW.fencing_token);
+END;
+
+-- 建 job 即拆 deps：INSERT jobs 后原子拆分逗号分隔的 deps 写入 job_deps。
+-- 拆分失败（如注入的触发器）会连 INSERT jobs 一起回滚。
+CREATE TRIGGER IF NOT EXISTS split_deps_on_insert
+AFTER INSERT ON jobs
+WHEN NEW.deps IS NOT NULL AND NEW.deps != ''
+BEGIN
+    INSERT OR IGNORE INTO job_deps(job_id, dep_id)
+    WITH RECURSIVE split(job_id, dep, rest) AS (
+        SELECT NEW.job_id, '', NEW.deps || ','
+        UNION ALL
+        SELECT job_id,
+               substr(rest, 1, instr(rest, ',') - 1),
+               substr(rest, instr(rest, ',') + 1)
+        FROM split WHERE rest != ''
+    )
+    SELECT job_id, dep FROM split WHERE dep != '';
+END;
+
+-- 完成即记结果：UPDATE jobs（status→done）后原子把 result 写入 job_effects。
+-- 记录失败会连状态更新一起回滚，保证「结果」与「完成」同生共死。
+CREATE TRIGGER IF NOT EXISTS record_effect_on_done
+AFTER UPDATE OF status ON jobs
+WHEN NEW.status='done' AND NEW.result IS NOT NULL AND NEW.result != ''
+BEGIN
+    INSERT OR IGNORE INTO job_effects(job_id, result) VALUES(NEW.job_id, NEW.result);
+END;
 SQL
+    # Upgrade existing databases; a concurrent initializer may have added it already.
+    if ! dbq "SELECT name FROM pragma_table_info('jobs');" | grep -qx owner_session; then
+        db "ALTER TABLE jobs ADD COLUMN owner_session TEXT;" >/dev/null 2>&1 || {
+            dbq "SELECT name FROM pragma_table_info('jobs');" | grep -qx owner_session || return 1
+        }
+    fi
+    if ! dbq "SELECT name FROM pragma_table_info('jobs');" | grep -qx result; then
+        db "ALTER TABLE jobs ADD COLUMN result TEXT;" >/dev/null 2>&1 || {
+            dbq "SELECT name FROM pragma_table_info('jobs');" | grep -qx result || return 1
+        }
+    fi
 
     # core.md 模板（文件投影仍保留给人看）
     [ -f "$CORE_FILE" ] || cat > "$CORE_FILE" <<'CORE'
@@ -297,35 +377,26 @@ board_ack() {
 board_start() {
     local task_id="${1:-}"
     [ -n "$task_id" ] || { echo "[board] start 需要 <task_id>" >&2; return 1; }
-    board_init
-    local owner="${2:-${BOARD_OWNER:-unknown}}"
-    local lease=$(( $(now_epoch) + LEASE_SECONDS ))
-
-    # 新任务：INSERT（token=1）；已存在则 DO NOTHING
-    db "INSERT INTO tasks(task_id,status,fencing_token,lease_epoch,owner,pid,updated_at)
-        VALUES($(sql_quote "$task_id"),'running',1,$lease,$(sql_quote "$owner"),$$,$(now_epoch))
-        ON CONFLICT(task_id) DO NOTHING;" 2>/dev/null || true
-
-    local status
-    status=$(dbq "SELECT status FROM tasks WHERE task_id=$(sql_quote "$task_id");" 2>/dev/null || echo "")
-
-    case "$status" in
-        running)
-            # 已在运行：幂等返回现有 token
-            dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
-            ;;
-        failed)
-            # 失败重试：原子重置 running + token+1（RETURNING，无先查后改竞态）
-            db "UPDATE tasks SET status='running', fencing_token=fencing_token+1, lease_epoch=$lease,
-                owner=$(sql_quote "$owner"), pid=$$, updated_at=$(now_epoch)
-                WHERE task_id=$(sql_quote "$task_id") AND status='failed'
-                RETURNING fencing_token;"
-            ;;
-        done)
-            echo "[board] 拒绝：任务已 done，不可重启（fencing）" >&2; return 1 ;;
-        *)
-            dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");" ;;
-    esac
+    valid_task_id "$task_id" || return 1
+    board_init || return 1
+    local owner="${2:-${BOARD_OWNER:-unknown}}" token
+    local now; now=$(now_epoch)
+    local lease=$(( now + LEASE_SECONDS ))
+    # Single transaction: no gap between status/owner checks and token retrieval.
+    token=$(db "BEGIN IMMEDIATE;
+        INSERT INTO tasks(task_id,status,fencing_token,lease_epoch,owner,pid,updated_at)
+        VALUES($(sql_quote "$task_id"),'running',1,$lease,$(sql_quote "$owner"),$$,$now)
+        ON CONFLICT(task_id) DO UPDATE SET status='running',
+            fencing_token=tasks.fencing_token+1, lease_epoch=$lease,
+            owner=excluded.owner,pid=excluded.pid,updated_at=$now
+        WHERE tasks.status='failed';
+        SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id")
+          AND status='running' AND owner=$(sql_quote "$owner") AND lease_epoch >= $now;
+        COMMIT;") || return 1
+    is_int "$token" && [ "$token" -gt 0 ] || {
+        echo "[board] start 拒绝：非本人、已完成或租约过期" >&2; return 1;
+    }
+    printf '%s\n' "$token"
 }
 
 # ── claim：抢占孤儿任务（lease 过期 + grace），RETURNING 新 token ──
@@ -439,32 +510,12 @@ board_guard() {
         esac
     done
 
-    board_init
-    if [ -n "$token" ]; then
-        is_int "$token" || { echo "[board] guard 的 --token 必须是非负整数" >&2; return 1; }
-    fi
-    local now expired
-    now=$(now_epoch)
-    expired=$(( now - GRACE_SECONDS ))
-
+    is_int "$token" || { echo "[board] guard requires --token" >&2; return 1; }
+    board_init || return 1
     local ok
-    ok=$(dbq "SELECT COUNT(*) FROM tasks
-              WHERE task_id=$(sql_quote "$task_id") AND status='running' AND lease_epoch >= $expired"
-              2>/dev/null || echo 0)
-    if [ "$ok" != "1" ]; then
-        echo "[board] guard 拒绝：任务已失权（被抢占/过期）" >&2
-        return 1
-    fi
-    if [ -n "$token" ]; then
-        local match
-        match=$(dbq "SELECT COUNT(*) FROM tasks WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token" 2>/dev/null || echo 0)
-        if [ "$match" != "1" ]; then
-            echo "[board] guard 拒绝：fencing token 不匹配（已被抢占）" >&2
-            return 1
-        fi
-    fi
-    echo "[board] guard 通过：可继续副作用"
-    return 0
+    ok=$(dbq "SELECT COUNT(*) FROM tasks WHERE task_id=$(sql_quote "$task_id")
+        AND status='running' AND fencing_token=$token AND lease_epoch >= $(now_epoch);") || return 1
+    [ "$ok" = 1 ] || { echo "[board] guard 拒绝：已失权" >&2; return 1; }
 }
 
 # ── remember：语义记忆（按 context 去重）───────────────────────────
@@ -496,6 +547,7 @@ board_remember() {
 board_handoff() {
     local task_id="${1:-}"; shift || true
     [ -n "$task_id" ] || { echo "[board] handoff 需要 <task_id>" >&2; return 1; }
+    valid_task_id "$task_id" || return 1
     local from="" status="" outcome="" artifacts="" risks="" next=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -540,6 +592,7 @@ board_export() {
     # state/*.json（任务状态投影）
     local f
     while IFS='|' read -r task_id status token verdict lease owner; do
+        valid_task_id "$task_id" || return 1
         f="$STATE_DIR/${task_id}.json"
         if has_jq; then
             jq -cn --arg id "$task_id" --arg status "$status" --argjson token "$token" \
@@ -603,15 +656,37 @@ board_job_create() {
     done
     [ -n "$id" ] && [ -n "$type" ] || { echo "[board] job-create 需要 --id 和 --type" >&2; return 1; }
     is_int "$priority" || { echo "[board] job-create 的 --priority 必须是非负整数" >&2; return 1; }
-    board_init
-    db "INSERT INTO jobs(job_id,type,payload,deps,priority) VALUES($(sql_quote "$id"),$(sql_quote "$type"),$(sql_quote "$payload"),$(sql_quote "$deps"),$priority);"
-    # 拆分 deps 写入关系表（精确等值，避免逗号串的 LIKE 通配符问题）
-    if [ -n "$deps" ]; then
-        local d
-        for d in ${deps//,/ }; do
-            [ -n "$d" ] && db "INSERT OR IGNORE INTO job_deps(job_id,dep_id) VALUES($(sql_quote "$id"),$(sql_quote "$d"));" 2>/dev/null || true
-        done
-    fi
+    valid_task_id "$id" || return 1
+    board_init || return 1
+    case "$deps" in *$'\n'*|*$'\r'*) echo "[board] deps must be a single line" >&2; return 1 ;; esac
+    # 校验每个 dep 的 task_id 格式（环/自环由 job_deps_acyclic 触发器在插入时拒绝）
+    local d
+    IFS=',' read -r -a dep_list <<< "$deps"
+    for d in "${dep_list[@]+"${dep_list[@]}"}"; do
+        [ -n "$d" ] || continue
+        valid_task_id "$d" || return 1
+    done
+    # 单条 INSERT jobs；split_deps_on_insert 触发器原子拆分 deps 写 job_deps，
+    # job_deps_acyclic 触发器拒绝环/自环——任一失败都会连 INSERT jobs 一起回滚。
+    db "INSERT INTO jobs(job_id,type,payload,deps,priority)
+        VALUES($(sql_quote "$id"),$(sql_quote "$type"),$(sql_quote "$payload"),$(sql_quote "$deps"),$priority);" || return 1
+    # 依赖已 dead 的新 job 立即标 dead（传播）
+    db "$(job_dead_sql)"
+}
+
+# Recursive propagation also handles jobs created after an ancestor died.
+job_dead_sql() {
+    cat <<'SQL'
+WITH RECURSIVE blocked(id) AS (
+    SELECT job_id FROM jobs WHERE status='dead'
+    UNION
+    SELECT d.job_id FROM job_deps d JOIN blocked b ON d.dep_id=b.id
+)
+UPDATE jobs SET status='dead', verdict='dependency dead',
+    fencing_token=fencing_token+1, lease_epoch=NULL, owner_session=NULL,
+    assigned_to=NULL, updated_at=strftime('%s','now')
+WHERE job_id IN (SELECT id FROM blocked) AND status IN ('pending','ready','running','failed');
+SQL
 }
 
 # job-ready：把依赖已满足的 pending 标记为 ready（scheduler 调用）
@@ -619,105 +694,109 @@ board_job_ready() {
     board_init
     # 依赖满足：job_deps 里每个 dep 都存在（LEFT JOIN 非空）且 status='done'
     # 缺失依赖 → dj.job_id IS NULL → NOT EXISTS 为 false → 不放行
-    db "UPDATE jobs SET status='ready', updated_at=$(now_epoch)
+    db "BEGIN IMMEDIATE; $(job_dead_sql) UPDATE jobs SET status='ready', updated_at=$(now_epoch)
         WHERE status='pending'
           AND NOT EXISTS (
             SELECT 1 FROM job_deps d
             LEFT JOIN jobs dj ON dj.job_id = d.dep_id
             WHERE d.job_id = jobs.job_id
               AND (dj.job_id IS NULL OR dj.status != 'done')
-          );"
+          ); COMMIT;" || return 1
     dbq "SELECT job_id FROM jobs WHERE status='ready' ORDER BY priority DESC, created_at ASC;"
 }
 
 # job-claim：调度器认领 job（ready→running，fencing_token+1，设 lease）
 # board job-claim --id X --agent A
 board_job_claim() {
-    local id="" agent=""
+    local id="" agent="" limit="${MAX_INFLIGHT_PER_AGENT:-1}"
     while [ $# -gt 0 ]; do
         case "$1" in
             --id) id="$2"; shift 2 ;;
             --agent) agent="$2"; shift 2 ;;
-            *) shift ;;
+            *) echo "[board] unknown claim option: $1" >&2; return 1 ;;
         esac
     done
-    [ -n "$id" ] && [ -n "$agent" ] || { echo "[board] job-claim 需要 --id 和 --agent" >&2; return 1; }
-    board_init
-    local lease=$(( $(now_epoch) + LEASE_SECONDS ))
-    db "UPDATE jobs SET status='running', assigned_to=$(sql_quote "$agent"),
-            fencing_token=fencing_token+1, lease_epoch=$lease, updated_at=$(now_epoch)
+    [ -n "$id" ] && [ -n "$agent" ] || return 1
+    is_int "$limit" && [ "$limit" -gt 0 ] || return 1
+    board_init || return 1
+    local now lease token
+    now=$(now_epoch); lease=$(( now + LEASE_SECONDS ))
+    # 单条 UPDATE 认领；dispatch_on_claim 触发器在同一事务里原子插入派发消息。
+    # 触发器失败会连认领一起回滚（job 回到 ready），避免「认领成功但没派发」的卡死。
+    token=$(db "UPDATE jobs SET status='running', assigned_to=$(sql_quote "$agent"),
+            owner_session=(SELECT session FROM agents WHERE agent=$(sql_quote "$agent")),
+            fencing_token=fencing_token+1, lease_epoch=$lease, updated_at=$now
         WHERE job_id=$(sql_quote "$id") AND status='ready'
-        RETURNING fencing_token;"
+          AND EXISTS (SELECT 1 FROM agents WHERE agent=$(sql_quote "$agent") AND expires > $now)
+          AND (SELECT COUNT(*) FROM jobs WHERE assigned_to=$(sql_quote "$agent") AND status='running') < $limit
+        RETURNING fencing_token;") || return 1
+    is_int "$token" && [ "$token" -gt 0 ] || return 1
+    printf '%s\n' "$token"
 }
 
-# job-done：完成（fencing CAS）
-# board job-done --id X --token T [--verdict V]
-board_job_done() {
-    local id="" token="" verdict="" agent=""
+# All execution operations require the full grant: job, agent, session, token,
+# unexpired lease AND current agent health. No optional-owner bypass.
+board_job_owned() {
+    local action="$1"; shift
+    local id="" token="" agent="" session="" verdict="" effect=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --id) id="$2"; shift 2 ;;
             --token) token="$2"; shift 2 ;;
-            --verdict) verdict="$2"; shift 2 ;;
             --agent) agent="$2"; shift 2 ;;
-            *) shift ;;
+            --session) session="$2"; shift 2 ;;
+            --verdict) verdict="$2"; shift 2 ;;
+            --effect) effect="$2"; shift 2 ;;
+            *) echo "[board] unknown job option: $1" >&2; return 1 ;;
         esac
     done
-    [ -n "$id" ] || { echo "[board] job-done 需要 --id" >&2; return 1; }
-    is_int "$token" || { echo "[board] job-done 的 --token 必须是非负整数" >&2; return 1; }
-    board_init
-    local now; now=$(now_epoch)
-    local affected
-    affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
-        UPDATE jobs SET status='done', verdict=$(sql_quote "$verdict"), updated_at=$now
-        WHERE job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token
-          AND COALESCE(lease_epoch,0) >= $now
-          AND (assigned_to=$(sql_quote "$agent") OR $(sql_quote "$agent")='');
-        SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
-    [ "$affected" = "1" ] || { echo "[board] job-done 拒绝：token 不匹配/租约过期/非本人" >&2; return 1; }
+    [ -n "$id" ] && [ -n "$agent" ] && [ -n "$session" ] && is_int "$token" || return 1
+    board_init || return 1
+    local now predicate statement affected
+    now=$(now_epoch)
+    predicate="job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token
+        AND lease_epoch >= $now AND assigned_to=$(sql_quote "$agent")
+        AND owner_session=$(sql_quote "$session")
+        AND EXISTS (SELECT 1 FROM agents a WHERE a.agent=jobs.assigned_to
+                    AND a.session=jobs.owner_session AND a.expires > $now)"
+    case "$action" in
+        guard) statement="SELECT COUNT(*) FROM jobs WHERE $predicate;" ;;
+        heartbeat) statement="UPDATE jobs SET lease_epoch=$((now + LEASE_SECONDS)), updated_at=$now
+                             WHERE $predicate; SELECT changes();" ;;
+        done)
+            # 单条 UPDATE 标记 done + 存 result；record_effect_on_done 触发器
+            # 原子把 result 写入 job_effects（记录失败会连状态更新一起回滚）。
+            statement="UPDATE jobs SET status='done',result=$(sql_quote "$effect"),verdict=$(sql_quote "$verdict"),updated_at=$now
+                WHERE $predicate; SELECT changes();" ;;
+        fail)
+            statement="UPDATE jobs SET attempts=attempts+1,
+                status=CASE WHEN attempts+1 >= max_attempts THEN 'dead' ELSE 'pending' END,
+                fencing_token=fencing_token+1,lease_epoch=NULL,owner_session=NULL,assigned_to=NULL,
+                verdict=$(sql_quote "$verdict"),updated_at=$now
+                WHERE $predicate; SELECT changes(); $(job_dead_sql)" ;;
+        *) return 1 ;;
+    esac
+    affected=$(db "BEGIN IMMEDIATE; $statement COMMIT;") || return 1
+    [ "$affected" = 1 ] || { echo "[board] job-$action 拒绝：token/session/租约/健康不匹配" >&2; return 1; }
 }
+board_job_guard() { board_job_owned guard "$@"; }
+board_job_heartbeat() { board_job_owned heartbeat "$@"; }
+board_job_done() { board_job_owned done "$@"; }
+board_job_fail() { board_job_owned fail "$@"; }
 
-# job-fail：失败（attempts+1，超过 max_attempts → dead）——死信机制
-# board job-fail --id X --token T [--verdict V]
-board_job_fail() {
-    local id="" token="" verdict="" agent=""
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --id) id="$2"; shift 2 ;;
-            --token) token="$2"; shift 2 ;;
-            --verdict) verdict="$2"; shift 2 ;;
-            --agent) agent="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-    [ -n "$id" ] || { echo "[board] job-fail 需要 --id" >&2; return 1; }
-    is_int "$token" || { echo "[board] job-fail 的 --token 必须是非负整数" >&2; return 1; }
-    board_init
-    local now; now=$(now_epoch)
-    local affected
-    affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
-        UPDATE jobs SET
-            attempts=attempts+1,
-            status=CASE WHEN attempts+1 >= max_attempts THEN 'dead' ELSE 'pending' END,
-            verdict=$(sql_quote "$verdict"), updated_at=$now
-        WHERE job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token
-          AND COALESCE(lease_epoch,0) >= $now
-          AND (assigned_to=$(sql_quote "$agent") OR $(sql_quote "$agent")='');
-        SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
-    [ "$affected" = "1" ] || { echo "[board] job-fail 拒绝：token 不匹配/租约过期/非本人" >&2; return 1; }
-}
-
-# job-reap：回收 lease 过期的 running（scheduler 每轮调用）
-# 过期 running → attempts+1 → pending（重试）或 dead（超 max）；fencing_token+1 使旧持有者失效
+# Reclaim expired leases, lost agents and replaced sessions; revoke old tokens.
 board_job_reap() {
-    board_init
+    board_init || return 1
     local now; now=$(now_epoch)
-    db "UPDATE jobs SET
-            attempts=attempts+1,
+    db "BEGIN IMMEDIATE;
+        UPDATE jobs SET attempts=attempts+1,
             status=CASE WHEN attempts+1 >= max_attempts THEN 'dead' ELSE 'pending' END,
-            fencing_token=fencing_token+1,
-            assigned_to=NULL, lease_epoch=NULL, updated_at=$now
-        WHERE status='running' AND COALESCE(lease_epoch,0) < $now;"
+            fencing_token=fencing_token+1, assigned_to=NULL, owner_session=NULL,
+            lease_epoch=NULL, updated_at=$now
+        WHERE status='running' AND (COALESCE(lease_epoch,0) < $now
+            OR NOT EXISTS (SELECT 1 FROM agents a WHERE a.agent=jobs.assigned_to
+                           AND a.session=jobs.owner_session AND a.expires > $now));
+        $(job_dead_sql) COMMIT;"
 }
 
 # job-list：列 job（可过滤状态）
@@ -741,12 +820,13 @@ board_job_list() {
 # agent-heartbeat：注册/续期。worker 启动时调用，之后定期续期。
 # board agent-heartbeat --agent X --session S [--ttl N]
 board_agent_heartbeat() {
-    local agent="" session="" ttl=30
+    local agent="" session="" ttl=30 register=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --agent) agent="$2"; shift 2 ;;
             --session) session="$2"; shift 2 ;;
             --ttl) ttl="$2"; shift 2 ;;
+            --register) register=1; shift ;;
             *) shift ;;
         esac
     done
@@ -754,8 +834,12 @@ board_agent_heartbeat() {
     is_int "$ttl" || { echo "[board] --ttl 必须是非负整数" >&2; return 1; }
     board_init
     local expires=$(( $(now_epoch) + ttl ))
-    db "INSERT INTO agents(agent,session,expires,updated_at) VALUES($(sql_quote "$agent"),$(sql_quote "$session"),$expires,$(now_epoch))
-        ON CONFLICT(agent) DO UPDATE SET session=excluded.session, expires=excluded.expires, updated_at=excluded.updated_at;"
+    local affected
+    affected=$(db "INSERT INTO agents(agent,session,expires,updated_at) VALUES($(sql_quote "$agent"),$(sql_quote "$session"),$expires,$(now_epoch))
+        ON CONFLICT(agent) DO UPDATE SET session=excluded.session, expires=excluded.expires, updated_at=excluded.updated_at
+        WHERE agents.session=excluded.session OR $register=1;
+        SELECT changes();") || return 1
+    [ "$affected" = 1 ] || { echo "[board] agent session replaced" >&2; return 1; }
 }
 
 # agents-online：列在线 agent（expires > now），供 scheduler 路由时只选在线者
@@ -804,6 +888,8 @@ board_main() {
         job-create) shift; board_job_create "$@" ;;
         job-ready)  shift; board_job_ready "$@" ;;
         job-claim)  shift; board_job_claim "$@" ;;
+        job-guard)  shift; board_job_guard "$@" ;;
+        job-heartbeat) shift; board_job_heartbeat "$@" ;;
         job-done)   shift; board_job_done "$@" ;;
         job-fail)   shift; board_job_fail "$@" ;;
         job-reap)   shift; board_job_reap "$@" ;;
@@ -820,7 +906,7 @@ board.sh <command> [args]   (v4 · SQLite)
   claim  <task_id> [owner]      抢占孤儿任务（lease 过期+grace），RETURNING 新 token
   state  <task_id> <done|failed> [--token T] [--verdict V]   (fencing CAS 提交)
   heartbeat <task_id> [--token T]
-  guard  <task_id> [--token T]  副作用前置校验（返回 0=可继续，1=已失权）
+  guard  <task_id> --token T  副作用前置校验（返回 0=可继续，1=已失权）
   check  <task_id>              判活：running|done|failed|orphaned|unknown
   remember --author X --text T [--context C --type T --status S]
   handoff <task_id> --from X [--outcome O ...]
@@ -828,6 +914,16 @@ board.sh <command> [args]   (v4 · SQLite)
   compact                       WAL checkpoint + 重建投影
   search <kw>                   SQLite LIKE 检索
   agents                        列出名片卡
+  agent-heartbeat --agent A --session S [--ttl N] [--register]
+                                启动时 --register，续期时省略（禁止旧 session 抢回）
+  job-create --id X --type T [--deps a,b --payload P --priority N]
+  job-ready                     更新 ready / 递归传播 dead
+  job-claim --id X --agent A     原子认领并发消息；默认每 agent 最多 1 个在途
+  job-guard|job-heartbeat|job-done|job-fail
+      --id X --agent A --session S --token T [--verdict V]
+  job-done ... [--effect RESULT] 原子记录幂等结果（job_id 唯一）并完成
+  job-reap                      回收过期 lease / 失联或被替换的 session
+  job-list [--status STATUS]
 HELP
             ;;
         *) echo "[board] 未知命令: $1" >&2; return 1 ;;
