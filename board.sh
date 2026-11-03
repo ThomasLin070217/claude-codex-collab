@@ -453,6 +453,14 @@ board_export() {
     echo "[board] export 完成：投影已从 board.db 重建"
 }
 
+# ── compact：WAL checkpoint（释放空间）+ 重建投影 ──────────────────
+board_compact() {
+    board_init
+    sqlite3 "$DB" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
+    board_export
+    echo "[board] compact 完成：WAL 已 checkpoint，投影已重建"
+}
+
 # ── search：检索（优先 SQLite LIKE，回退 grep 投影）────────────────
 board_search() {
     board_init
@@ -500,6 +508,7 @@ board_main() {
         remember)   shift; board_remember "$@" ;;
         handoff)    shift; board_handoff "$@" ;;
         export)     shift; board_export "$@" ;;
+        compact)    shift; board_compact "$@" ;;
         search)     shift; board_search "$@" ;;
         agents)     shift; board_agents "$@" ;;
         help|"")
@@ -517,6 +526,7 @@ board.sh <command> [args]   (v4 · SQLite)
   remember --author X --text T [--context C --type T --status S]
   handoff <task_id> --from X [--outcome O ...]
   export                        从 SQLite 重建文件投影（只读）
+  compact                       WAL checkpoint + 重建投影
   search <kw>                   SQLite LIKE 检索
   agents                        列出名片卡
 HELP
