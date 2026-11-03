@@ -45,14 +45,16 @@ sql_quote() {
     printf "'%s'" "$s"
 }
 
-# db：执行写/更新（-bail 出错即停；.timeout 设 busy 等待，不输出）
+# db：执行写/更新（PRAGMA busy_timeout 更可靠；awk 滤掉其返回值 "5000"）
+# 注意用 PIPESTATUS 保留 sqlite3 的真实退出码，供 || 错误处理。
 db() {
-    sqlite3 -bail -cmd ".timeout 5000" "$DB" "$1"
+    sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000; $1" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}'
+    return "${PIPESTATUS[0]}"
 }
 
-# dbq：查询，返回 stdout
+# dbq：查询，返回 stdout（同样滤掉 PRAGMA 返回值）
 dbq() {
-    sqlite3 -cmd ".timeout 5000" "$DB" "$1"
+    sqlite3 "$DB" "PRAGMA busy_timeout=5000; $1" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}'
 }
 
 # payload_hash：ref 指向的文件内容哈希（不可变产物关联）
@@ -79,7 +81,8 @@ board_init() {
         return 1
     fi
 
-    sqlite3 "$DB" >/dev/null <<'SQL'
+    sqlite3 "$DB" >/dev/null 2>&1 <<'SQL'
+PRAGMA busy_timeout=5000;
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
 PRAGMA foreign_keys=ON;
@@ -303,10 +306,10 @@ board_state() {
     if [ -n "$token" ]; then
         # fencing CAS：token 匹配 + 当前 running + lease 未过期（UPDATE + changes() 同连接）
         local affected
-        affected=$(sqlite3 -bail -cmd ".timeout 5000" "$DB" "
+        affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
             UPDATE tasks SET status='$status', fencing_token=fencing_token+1, verdict=$(sql_quote "$verdict"), updated_at=$now
             WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token AND status='running' AND lease_epoch >= $now;
-            SELECT changes();")
+            SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
         if [ "$affected" != "1" ]; then
             echo "[board] fencing 拒绝：token 不匹配或已失权（旧持有者）" >&2
             return 1

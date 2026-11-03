@@ -250,13 +250,16 @@ $prompt" ;;
 $prompt" ;;
     esac
 
-    # ── v2: 总线 + 状态机 ────────────────────────────────
+    # ── v4: 总线 + fencing 状态机 ─────────────────────────
     # 写一条总线消息（payload 走 ref，不走全文）
     board_write --from codex --to claude --type "$mode" --task "$task_id" \
         --summary "${prompt:0:120}" || true
 
-    # 真状态机：启动写 running
-    board_state "$task_id" running 2>/dev/null || true
+    # fencing：启动拿 token（提交终态时 CAS 用）
+    local TOKEN=""
+    if [ -n "$task_id" ]; then
+        TOKEN=$(board_start "$task_id" codex 2>/dev/null || echo "")
+    fi
 
     local sandbox="read-only"
     local codex_args=("$CODEX_BIN" exec -s read-only --skip-git-repo-check "$full_prompt")
@@ -297,11 +300,13 @@ $prompt" ;;
         fi
     fi
 
-    # 真状态机：退出写 done/failed + verdict + 真实 pid
-    if [ $rc -eq 0 ]; then
-        board_state "$task_id" done --verdict "$verdict" --pid "$CODEX_PID" 2>/dev/null || true
-    else
-        board_state "$task_id" failed --verdict "$verdict" --pid "$CODEX_PID" 2>/dev/null || true
+    # 提交终态（带 fencing token 的 CAS；无 task_id 则跳过）
+    if [ -n "$task_id" ] && [ -n "$TOKEN" ]; then
+        if [ $rc -eq 0 ]; then
+            board_state "$task_id" done --token "$TOKEN" --verdict "$verdict" --pid "$CODEX_PID" 2>/dev/null || true
+        else
+            board_state "$task_id" failed --token "$TOKEN" --verdict "$verdict" --pid "$CODEX_PID" 2>/dev/null || true
+        fi
     fi
 
     exit $rc
