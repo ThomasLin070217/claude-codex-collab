@@ -28,6 +28,8 @@ STATE_DIR="$COLLAB_DIR/state"
 AGENTS_DIR="$COLLAB_DIR/agents"
 
 LEASE_SECONDS="${LEASE_SECONDS:-1800}"
+# 时钟漂移容忍：lease 过期判断再宽限这几秒（权威仍是 fencing_token CAS，时钟只做粗粒度超时）
+GRACE_SECONDS="${GRACE_SECONDS:-5}"
 
 # ── 工具 ──────────────────────────────────────────────────────────
 now_iso() { date -Iseconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z'; }
@@ -210,22 +212,39 @@ board_read() {
     board_init
 
     if [ "$all" = "1" ]; then
-        # 调试/重建：读全部，不推进游标
+        # 调试/重建：读全部（不推进游标）
         dbq "SELECT json_object('seq',seq,'id',id,'ts',ts,'from',from_agent,'to',to_agent,'type',type,'task',task_id,'ref',ref,'summary',summary)
              FROM messages ORDER BY seq;"
         return 0
     fi
 
-    # 事务：读 last_seq 之后 + 推进 last_seq（崩溃回滚 → 不丢不重）
-    dbq "BEGIN IMMEDIATE;
-         SELECT json_object('seq',seq,'id',id,'ts',ts,'from',from_agent,'to',to_agent,'type',type,'task',task_id,'ref',ref,'summary',summary)
+    # at-least-once：只读不推进游标。agent 处理完须显式 `board ack` 推进。
+    # 崩溃时游标未推进 → 重读（可能重复，靠消息 id 幂等）。
+    dbq "SELECT json_object('seq',seq,'id',id,'ts',ts,'from',from_agent,'to',to_agent,'type',type,'task',task_id,'ref',ref,'summary',summary)
          FROM messages
          WHERE seq > COALESCE((SELECT last_seq FROM consumption WHERE agent=$(sql_quote "$as")), 0)
-         ORDER BY seq;
-         INSERT INTO consumption(agent,last_seq,updated_at)
-         VALUES($(sql_quote "$as"), (SELECT COALESCE(MAX(seq),0) FROM messages), $(now_epoch))
-         ON CONFLICT(agent) DO UPDATE SET last_seq=excluded.last_seq, updated_at=excluded.updated_at;
-         COMMIT;"
+         ORDER BY seq;"
+}
+
+# ── ack：处理完成后推进游标（幂等，只增不减）──────────────────────
+# board ack --as X --seq N
+board_ack() {
+    local as="" seq=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --as) as="$2"; shift 2 ;;
+            --seq) seq="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$as" ] && [ -n "$seq" ] || { echo "[board] ack 需要 --as 和 --seq" >&2; return 1; }
+
+    board_init
+    # 幂等推进：MAX 防回退（重复 ack 无害）
+    db "INSERT INTO consumption(agent,last_seq,updated_at)
+        VALUES($(sql_quote "$as"), $seq, $(now_epoch))
+        ON CONFLICT(agent) DO UPDATE SET last_seq=MAX(last_seq, excluded.last_seq), updated_at=excluded.updated_at;"
+    echo "[board] ack: $as 已确认到 seq=$seq"
 }
 
 # ── start：启动新任务（token=1），返回 token ───────────────────────
@@ -262,17 +281,19 @@ board_start() {
     dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
 }
 
-# ── claim：抢占孤儿任务（lease 过期），RETURNING 新 token ──────────
+# ── claim：抢占孤儿任务（lease 过期 + grace），RETURNING 新 token ──
 board_claim() {
     local task_id="${1:-}"
     [ -n "$task_id" ] || { echo "[board] claim 需要 <task_id>" >&2; return 1; }
     board_init
     local owner="${2:-${BOARD_OWNER:-unknown}}"
     local lease=$(( $(now_epoch) + LEASE_SECONDS ))
+    # 判活加 grace period（容忍时钟漂移）；fencing_token+1 才是权威抢占
+    local expired_ts=$(( $(now_epoch) - GRACE_SECONDS ))
     db "UPDATE tasks
         SET status='running', fencing_token=fencing_token+1, lease_epoch=$lease,
             owner=$(sql_quote "$owner"), pid=$$, updated_at=$(now_epoch)
-        WHERE task_id=$(sql_quote "$task_id") AND status='running' AND lease_epoch < $(now_epoch)
+        WHERE task_id=$(sql_quote "$task_id") AND status='running' AND lease_epoch < $expired_ts
         RETURNING fencing_token;"
 }
 
@@ -360,6 +381,47 @@ board_check() {
     else
         echo "$status"
     fi
+}
+
+# ── guard：副作用前置校验（fencing 覆盖到库外副作用）────────────────
+# agent 在执行副作用（写文件/调 API）前调用，确认自己仍持有任务权。
+# 返回 0=可继续；1=已被抢占/失权，应停止副作用。
+# board guard <task_id> --token X
+board_guard() {
+    local task_id="${1:-}"
+    [ -n "$task_id" ] || { echo "[board] guard 需要 <task_id>" >&2; return 1; }
+    shift || true
+    local token=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --token) token="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    board_init
+    local now expired
+    now=$(now_epoch)
+    expired=$(( now - GRACE_SECONDS ))
+
+    local ok
+    ok=$(dbq "SELECT COUNT(*) FROM tasks
+              WHERE task_id=$(sql_quote "$task_id") AND status='running' AND lease_epoch >= $expired"
+              2>/dev/null || echo 0)
+    if [ "$ok" != "1" ]; then
+        echo "[board] guard 拒绝：任务已失权（被抢占/过期）" >&2
+        return 1
+    fi
+    if [ -n "$token" ]; then
+        local match
+        match=$(dbq "SELECT COUNT(*) FROM tasks WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token" 2>/dev/null || echo 0)
+        if [ "$match" != "1" ]; then
+            echo "[board] guard 拒绝：fencing token 不匹配（已被抢占）" >&2
+            return 1
+        fi
+    fi
+    echo "[board] guard 通过：可继续副作用"
+    return 0
 }
 
 # ── remember：语义记忆（按 context 去重）───────────────────────────
@@ -500,11 +562,13 @@ board_main() {
         init)       shift; board_init "$@" ;;
         write)      shift; board_write "$@" ;;
         read)       shift; board_read "$@" ;;
+        ack)        shift; board_ack "$@" ;;
         start)      shift; board_start "$@" ;;
         claim)      shift; board_claim "$@" ;;
         state)      shift; board_state "$@" ;;
         heartbeat)  shift; board_heartbeat "$@" ;;
         check)      shift; board_check "$@" ;;
+        guard)      shift; board_guard "$@" ;;
         remember)   shift; board_remember "$@" ;;
         handoff)    shift; board_handoff "$@" ;;
         export)     shift; board_export "$@" ;;
@@ -517,11 +581,13 @@ board.sh <command> [args]   (v4 · SQLite)
 
   init                          建 SQLite schema + 目录
   write  --from X --to Y --type T --task ID [--ref P] [--summary S]   (返回 seq)
-  read   --as NAME [--all]      事务消费（读+推进游标）
+  read   --as NAME [--all]      读消息（不推进游标；处理完 ack）
+  ack    --as NAME --seq N      确认消费到 seq=N（幂等推进）
   start  <task_id> [owner]      启动任务（token=1），返回 token
-  claim  <task_id> [owner]      抢占孤儿任务（lease 过期），RETURNING 新 token
+  claim  <task_id> [owner]      抢占孤儿任务（lease 过期+grace），RETURNING 新 token
   state  <task_id> <done|failed> [--token T] [--verdict V]   (fencing CAS 提交)
   heartbeat <task_id> [--token T]
+  guard  <task_id> [--token T]  副作用前置校验（返回 0=可继续，1=已失权）
   check  <task_id>              判活：running|done|failed|orphaned|unknown
   remember --author X --text T [--context C --type T --status S]
   handoff <task_id> --from X [--outcome O ...]
