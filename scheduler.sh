@@ -17,9 +17,9 @@ export COLLAB_DIR
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/board.sh"
 
-# ── 能力路由：读名片卡，按 skill 匹配 job type ─────────────────────
+# ── 能力路由：读名片卡，按 skill 匹配 job type；只匹配「在线」agent ─
 match_agent() {
-    local type="$1" f name
+    local type="$1" f name online
     for f in "$AGENTS_DIR"/*.md; do
         [ -f "$f" ] || continue
         name=$(grep -m1 '^name:' "$f" 2>/dev/null | sed 's/^name:[[:space:]]*//')
@@ -28,10 +28,14 @@ match_agent() {
         case "$name" in scheduler|lead|human) continue ;; esac
         # 简单匹配：名片卡 skills 行包含该 type（固定字符串）
         if grep -m1 '^skills:' "$f" 2>/dev/null | grep -qF "$type"; then
-            echo "$name"; return 0
+            # 只匹配在线 agent（agents 表 expires > now）
+            online=$(dbq "SELECT COUNT(*) FROM agents WHERE agent=$(sql_quote "$name") AND expires > $(now_epoch);" 2>/dev/null || echo 0)
+            if [ "$online" = "1" ]; then
+                echo "$name"; return 0
+            fi
         fi
     done
-    echo "executor"   # 兜底
+    echo ""   # 无在线匹配 → 空（scheduler 跳过，等 agent 上线）
 }
 
 # ── 主循环 ────────────────────────────────────────────────────────
@@ -68,9 +72,14 @@ run() {
         job_id="${ready%%|*}"
         type="${ready##*|}"
 
-        # 3. 能力路由
+        # 3. 能力路由（只匹配在线 agent）
         local agent
         agent=$(match_agent "$type")
+        if [ -z "$agent" ]; then
+            # 无在线 agent 能做该类型：等待（不卡死，继续下一轮）
+            sleep 1
+            continue
+        fi
 
         # 4. 认领（fencing token）+ 发租约消息
         local token

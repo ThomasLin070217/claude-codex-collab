@@ -164,6 +164,14 @@ CREATE TABLE IF NOT EXISTS job_deps (
     dep_id  TEXT NOT NULL,
     PRIMARY KEY (job_id, dep_id)
 );
+
+-- agent 健康表（区分「能力声明」vs「在线状态」；scheduler 只派发给在线 agent）
+CREATE TABLE IF NOT EXISTS agents (
+    agent      TEXT PRIMARY KEY,
+    session    TEXT NOT NULL,             -- 每次启动的会话 id
+    expires    INTEGER NOT NULL,          -- 健康到期（epoch），到期即视为离线
+    updated_at INTEGER NOT NULL
+);
 SQL
 
     # core.md 模板（文件投影仍保留给人看）
@@ -729,6 +737,33 @@ board_job_list() {
     fi
 }
 
+# ── agent 健康（区分能力声明 vs 在线状态）──────────────────────────
+# agent-heartbeat：注册/续期。worker 启动时调用，之后定期续期。
+# board agent-heartbeat --agent X --session S [--ttl N]
+board_agent_heartbeat() {
+    local agent="" session="" ttl=30
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --agent) agent="$2"; shift 2 ;;
+            --session) session="$2"; shift 2 ;;
+            --ttl) ttl="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$agent" ] && [ -n "$session" ] || { echo "[board] agent-heartbeat 需要 --agent 和 --session" >&2; return 1; }
+    is_int "$ttl" || { echo "[board] --ttl 必须是非负整数" >&2; return 1; }
+    board_init
+    local expires=$(( $(now_epoch) + ttl ))
+    db "INSERT INTO agents(agent,session,expires,updated_at) VALUES($(sql_quote "$agent"),$(sql_quote "$session"),$expires,$(now_epoch))
+        ON CONFLICT(agent) DO UPDATE SET session=excluded.session, expires=excluded.expires, updated_at=excluded.updated_at;"
+}
+
+# agents-online：列在线 agent（expires > now），供 scheduler 路由时只选在线者
+board_agents_online() {
+    board_init
+    dbq "SELECT agent||'|'||session FROM agents WHERE expires > $(now_epoch) ORDER BY agent;"
+}
+
 # ── agents ─────────────────────────────────────────────────────────
 board_agents() {
     board_init
@@ -764,6 +799,8 @@ board_main() {
         compact)    shift; board_compact "$@" ;;
         search)     shift; board_search "$@" ;;
         agents)     shift; board_agents "$@" ;;
+        agent-heartbeat) shift; board_agent_heartbeat "$@" ;;
+        agents-online)   shift; board_agents_online "$@" ;;
         job-create) shift; board_job_create "$@" ;;
         job-ready)  shift; board_job_ready "$@" ;;
         job-claim)  shift; board_job_claim "$@" ;;

@@ -21,6 +21,18 @@ MAX_IDLE="${2:-30}"
 
 board_init >/dev/null 2>&1
 
+# 注册在线状态 + 后台心跳（每 10s 续期，健康 TTL 30s）
+SESSION="sess-$(date +%s)-$$-$RANDOM"
+board_agent_heartbeat --agent "$AGENT" --session "$SESSION" --ttl 30 >/dev/null 2>&1
+(
+    while :; do
+        sleep 10
+        board_agent_heartbeat --agent "$AGENT" --session "$SESSION" --ttl 30 >/dev/null 2>&1 || exit 0
+    done
+) &
+HB_PID=$!
+trap 'kill $HB_PID 2>/dev/null || true' EXIT
+
 idle=0
 while [ $idle -lt "$MAX_IDLE" ]; do
     msgs=$(board_read --as "$AGENT" --to "$AGENT" 2>/dev/null || true)
