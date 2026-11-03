@@ -133,6 +133,24 @@ CREATE TABLE IF NOT EXISTS memory (
     created_at  INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS memory_dedup ON memory(context, type, text);
+
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id        TEXT PRIMARY KEY,
+    type          TEXT NOT NULL,                       -- 能力类型（plan/execute/review/...）
+    payload       TEXT,                                -- 任务内容
+    deps          TEXT NOT NULL DEFAULT '',            -- 依赖的 job_id，逗号分隔（空=无依赖）
+    assigned_to   TEXT,                                -- 指派的 agent
+    status        TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','ready','running','done','failed','dead')),
+    priority      INTEGER NOT NULL DEFAULT 0,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    max_attempts  INTEGER NOT NULL DEFAULT 3,
+    fencing_token INTEGER NOT NULL DEFAULT 0,          -- 执行权（fencing）
+    lease_epoch   INTEGER,
+    verdict       TEXT,
+    created_at    INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority);
 SQL
 
     # core.md 模板（文件投影仍保留给人看）
@@ -197,13 +215,14 @@ board_write() {
     dbq "SELECT seq FROM messages WHERE id=$(sql_quote "$id");"
 }
 
-# ── read：事务消费（at-least-once，读+推进同一事务）────────────────
+# ── read：读消息（at-least-once，只读不推进；--to 过滤定向消息）────
 board_read() {
-    local as="" all=0
+    local as="" all=0 to=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --as) as="$2"; shift 2 ;;
             --all) all=1; shift ;;
+            --to) to="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
@@ -219,10 +238,15 @@ board_read() {
     fi
 
     # at-least-once：只读不推进游标。agent 处理完须显式 `board ack` 推进。
-    # 崩溃时游标未推进 → 重读（可能重复，靠消息 id 幂等）。
+    # --to：只读发给自己的（或广播 to 为空）的消息，避免吃掉别人的。
+    local where
+    where="seq > COALESCE((SELECT last_seq FROM consumption WHERE agent=$(sql_quote "$as")), 0)"
+    if [ -n "$to" ]; then
+        where="$where AND (to_agent=$(sql_quote "$to") OR to_agent='' OR to_agent IS NULL)"
+    fi
     dbq "SELECT json_object('seq',seq,'id',id,'ts',ts,'from',from_agent,'to',to_agent,'type',type,'task',task_id,'ref',ref,'summary',summary)
          FROM messages
-         WHERE seq > COALESCE((SELECT last_seq FROM consumption WHERE agent=$(sql_quote "$as")), 0)
+         WHERE $where
          ORDER BY seq;"
 }
 
@@ -540,6 +564,128 @@ board_search() {
     fi
 }
 
+# ═════════════════════════════════════════════════════════════════
+#  N-agent 调度（jobs：依赖图 + 能力路由 + fencing + 死信）
+# ═════════════════════════════════════════════════════════════════
+
+# job-create：创建任务（依赖逗号分隔，空=无依赖）
+# board job-create --id X --type T [--payload P --deps "a,b" --priority N]
+board_job_create() {
+    local id="" type="" payload="" deps="" priority=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --id) id="$2"; shift 2 ;;
+            --type) type="$2"; shift 2 ;;
+            --payload) payload="$2"; shift 2 ;;
+            --deps) deps="$2"; shift 2 ;;
+            --priority) priority="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$id" ] && [ -n "$type" ] || { echo "[board] job-create 需要 --id 和 --type" >&2; return 1; }
+    board_init
+    db "INSERT INTO jobs(job_id,type,payload,deps,priority) VALUES($(sql_quote "$id"),$(sql_quote "$type"),$(sql_quote "$payload"),$(sql_quote "$deps"),$priority);"
+}
+
+# job-ready：把依赖已满足的 pending 标记为 ready（scheduler 调用）
+board_job_ready() {
+    board_init
+    # 依赖满足：deps 为空，或 deps 里每个 job_id 都是 done
+    db "UPDATE jobs SET status='ready', updated_at=$(now_epoch)
+        WHERE status='pending'
+          AND (deps='' OR deps IS NULL
+               OR NOT EXISTS (
+                 SELECT 1 FROM jobs d
+                 WHERE ','||jobs.deps||',' LIKE '%,'||d.job_id||',%'
+                   AND d.status != 'done'
+               ));"
+    dbq "SELECT job_id FROM jobs WHERE status='ready' ORDER BY priority DESC, created_at ASC;"
+}
+
+# job-claim：调度器认领 job（ready→running，fencing_token+1，设 lease）
+# board job-claim --id X --agent A
+board_job_claim() {
+    local id="" agent=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --id) id="$2"; shift 2 ;;
+            --agent) agent="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$id" ] && [ -n "$agent" ] || { echo "[board] job-claim 需要 --id 和 --agent" >&2; return 1; }
+    board_init
+    local lease=$(( $(now_epoch) + LEASE_SECONDS ))
+    db "UPDATE jobs SET status='running', assigned_to=$(sql_quote "$agent"),
+            fencing_token=fencing_token+1, lease_epoch=$lease, updated_at=$(now_epoch)
+        WHERE job_id=$(sql_quote "$id") AND status='ready'
+        RETURNING fencing_token;"
+}
+
+# job-done：完成（fencing CAS）
+# board job-done --id X --token T [--verdict V]
+board_job_done() {
+    local id="" token="" verdict=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --id) id="$2"; shift 2 ;;
+            --token) token="$2"; shift 2 ;;
+            --verdict) verdict="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$id" ] || { echo "[board] job-done 需要 --id" >&2; return 1; }
+    board_init
+    local affected
+    affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
+        UPDATE jobs SET status='done', verdict=$(sql_quote "$verdict"), updated_at=$(now_epoch)
+        WHERE job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token;
+        SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
+    [ "$affected" = "1" ] || { echo "[board] job-done 拒绝：token 不匹配" >&2; return 1; }
+}
+
+# job-fail：失败（attempts+1，超过 max_attempts → dead）——死信机制
+# board job-fail --id X --token T [--verdict V]
+board_job_fail() {
+    local id="" token="" verdict=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --id) id="$2"; shift 2 ;;
+            --token) token="$2"; shift 2 ;;
+            --verdict) verdict="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    [ -n "$id" ] || { echo "[board] job-fail 需要 --id" >&2; return 1; }
+    board_init
+    local affected
+    affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
+        UPDATE jobs SET
+            attempts=attempts+1,
+            status=CASE WHEN attempts+1 >= max_attempts THEN 'dead' ELSE 'pending' END,
+            verdict=$(sql_quote "$verdict"), updated_at=$(now_epoch)
+        WHERE job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token;
+        SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
+    [ "$affected" = "1" ] || { echo "[board] job-fail 拒绝：token 不匹配" >&2; return 1; }
+}
+
+# job-list：列 job（可过滤状态）
+board_job_list() {
+    local status=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --status) status="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    board_init
+    if [ -n "$status" ]; then
+        dbq "SELECT job_id||'|'||type||'|'||status||'|'||COALESCE(assigned_to,'-')||'|'||attempts FROM jobs WHERE status=$(sql_quote "$status") ORDER BY created_at;"
+    else
+        dbq "SELECT job_id||'|'||type||'|'||status||'|'||COALESCE(assigned_to,'-')||'|'||attempts FROM jobs ORDER BY created_at;"
+    fi
+}
+
 # ── agents ─────────────────────────────────────────────────────────
 board_agents() {
     board_init
@@ -575,6 +721,12 @@ board_main() {
         compact)    shift; board_compact "$@" ;;
         search)     shift; board_search "$@" ;;
         agents)     shift; board_agents "$@" ;;
+        job-create) shift; board_job_create "$@" ;;
+        job-ready)  shift; board_job_ready "$@" ;;
+        job-claim)  shift; board_job_claim "$@" ;;
+        job-done)   shift; board_job_done "$@" ;;
+        job-fail)   shift; board_job_fail "$@" ;;
+        job-list)   shift; board_job_list "$@" ;;
         help|"")
             cat <<'HELP'
 board.sh <command> [args]   (v4 · SQLite)
