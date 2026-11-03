@@ -91,7 +91,10 @@ The slash command references `~/Agent/collab/codex-bridge.sh` and `~/Agent/colla
 | `board.sh read --as X [--all]` | incrementally read the bus (advances cursor) |
 | `board.sh handoff <task_id> --from X --outcome ...` | write a handoff file (conclusion only) |
 | `board.sh remember --author X --text ... --evidence P --status confirmed` | write to semantic memory (provenance + dedup) |
-| `board.sh state <task_id> <running\|done\|failed> --verdict V --pid N` | structured task state |
+| `board.sh state <task_id> <running\|done\|failed> --verdict V --pid N` | structured task state (running sets a lease) |
+| `board.sh heartbeat <task_id>` | renew the running task's lease |
+| `board.sh check <task_id>` | liveness: `running\|done\|failed\|orphaned\|unknown` |
+| `board.sh compact` | fold the old log into `archive/`, reset cursors |
 | `board.sh search <kw>` | search bus + memory (ripgrep, or grep fallback) |
 | `board.sh agents` | list agent cards |
 
