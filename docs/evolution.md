@@ -109,14 +109,35 @@
 
 ---
 
+## v5.1：三个 Codex 实测复核 → 7 类 bug 修复 + agent 健康心跳
+
+三个 Codex 深入读代码并**实测复现**了代码级 bug，修复：
+
+| bug | 修复 |
+|---|---|
+| sql_quote 在 macOS Bash 3.2 下转义失败 | 用变量承载单引号 |
+| **SQL 注入**（数字字段裸拼接） | `is_int()` 校验 token/seq/priority |
+| job-done/fail 不验租约/归属 | 加 `lease>=now` + `assigned_to=agent` |
+| job 无回收（卡 running） | 新增 `job-reap` |
+| 缺失依赖放行 + LIKE 通配符 | 改依赖关系表（精确 JOIN） |
+| token 冒领（worker 重读 token） | 消息携带 claim token |
+| board_start 竞态 + fencing 绕过 | 原子 UPDATE + RETURNING，去宽松分支 |
+
+**agent 健康心跳**（解决「名片声明会做」vs「谁现在在线」）：
+
+- `agents` 表：agent + session + expires（健康到期）
+- `board agent-heartbeat`：worker 注册 + 每 10s 续期（TTL 30s）
+- scheduler 只派发给**在线** agent（expires > now），离线则等待
+
+---
+
 ## 仍未做的（三个模型一致列出的「生产级」需求）
 
 按优先级（都是「上生产 / 上多机」才需要，单机双 agent 已够用）：
 
-1. **agent 健康心跳**：能力声明（名片卡）≠ 在线状态，需区分「谁会做」和「谁现在在线」
-2. **竞争消费语义**：当前是定向 `--to`，还没做「谁抢到谁做」的竞争消费
-3. **背压 / 优先级老化 / 因果序 / 观测**：N 变大时的队列治理
-4. **多机换 Postgres**：SQLite WAL 不支持跨机共享文件，多机需服务端数据库（FOR UPDATE SKIP LOCKED）
+1. **竞争消费语义**：当前是定向 `--to`，还没做「谁抢到谁做」的竞争消费
+2. **背压 / 优先级老化 / 因果序 / 观测**：N 变大时的队列治理
+3. **多机换 Postgres**：SQLite WAL 不支持跨机共享文件，多机需服务端数据库（FOR UPDATE SKIP LOCKED）
 
 ---
 
