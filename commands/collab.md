@@ -50,15 +50,20 @@ At the end of any session where collab was used, present a one-line summary:
 
 | Command | Purpose |
 |---|---|
-| `board.sh init` | 建目录 + 初始化分层记忆 |
-| `board.sh write --from X --to Y --type T --task ID --ref P --summary S` | 追加一条总线消息（payload 走 ref） |
-| `board.sh read --as claude` | 增量读总线（按游标） |
-| `board.sh handoff <task_id> --from codex --outcome ...` | 写交接文件 |
-| `board.sh remember --author X --text ... --evidence P --status confirmed` | 写语义记忆（带 provenance + 去重） |
-| `board.sh state <task_id> <running\|done\|failed> --verdict ...` | 结构化状态 |
-| `board.sh search <kw>` | 检索总线 + 语义记忆 |
+| `board.sh init` | 建 SQLite schema + 目录 |
+| `board.sh write --from X --to Y --type T --task ID --ref P --summary S` | 追加一条消息（返回 seq） |
+| `board.sh read --as claude` | 读消息（**不推进游标**；处理完须 ack） |
+| `board.sh ack --as claude --seq N` | 确认消费到 seq=N（幂等推进，at-least-once） |
+| `board.sh start <task_id>` | 启动任务（返回 fencing token） |
+| `board.sh claim <task_id>` | 抢占孤儿任务（lease 过期+grace） |
+| `board.sh state <task_id> done\|failed --token T` | fencing CAS 提交终态 |
+| `board.sh guard <task_id> --token T` | 副作用前置校验（返回 0=可继续） |
+| `board.sh remember --author X --text ... --context C` | 写语义记忆（context 去重） |
+| `board.sh search <kw>` | SQLite LIKE 检索 |
 
-> `codex-bridge.sh` 已经自动写总线消息和 state；你只需要在关键节点显式 `board.sh remember` 沉淀决策、`board.sh search` 检索历史。
+> **v4 消费协议（at-least-once）**：`read` 只读不推进；处理完消息后 `ack` 推进游标。崩溃时游标未推进 → 重读（重复靠消息 id 幂等）。
+> **副作用 fencing**：执行副作用（写文件/调 API）前先 `guard`，被抢占则停止。
+> `codex-bridge.sh` 已自动 `start`（拿 token）+ 提交时带 token 做 CAS；你只需 `read`/`ack`/`remember`/`guard`。
 
 ---
 
