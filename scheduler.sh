@@ -42,6 +42,9 @@ run() {
     while [ $round -lt $max_rounds ]; do
         round=$((round+1))
 
+        # 0. 回收 lease 过期的 running（防永久卡住 + fencing_token+1 使旧持有者失效）
+        board_job_reap >/dev/null 2>&1 || true
+
         # 1. 标记就绪（依赖满足的 pending → ready）
         board_job_ready >/dev/null 2>&1 || true
 
@@ -77,7 +80,7 @@ run() {
             continue
         fi
         board_write --from scheduler --to "$agent" --type task --task "$job_id" \
-            --summary "执行 job $job_id (type=$type)" >/dev/null 2>&1 || true
+            --summary "执行 job $job_id (type=$type) token=$token" >/dev/null 2>&1 || true
         echo "[scheduler] 派发 $job_id (type=$type) → $agent (token=$token)"
     done
 

@@ -33,16 +33,19 @@ while [ $idle -lt "$MAX_IDLE" ]; do
         [ -z "$line" ] && continue
         job_id=$(printf '%s' "$line" | jq -r '.task // empty' 2>/dev/null || echo "")
         seq=$(printf '%s' "$line" | jq -r '.seq // empty' 2>/dev/null || echo "")
+        summary=$(printf '%s' "$line" | jq -r '.summary // empty' 2>/dev/null || echo "")
         [ -n "$seq" ] && last_seq=$seq
         [ -z "$job_id" ] && continue
 
-        echo "[$AGENT] 执行 job $job_id ..."
+        # 从消息里取 claim token（scheduler 派发时携带），不重读 jobs 表（防冒领）
+        token=$(printf '%s' "$summary" | grep -o 'token=[0-9]*' | head -1 | cut -d= -f2)
+
+        echo "[$AGENT] 执行 job $job_id (token=$token) ..."
         sleep 0.5   # mock：真实场景替换为 codex-bridge / claude 调用
 
-        token=$(dbq "SELECT fencing_token FROM jobs WHERE job_id=$(sql_quote "$job_id");" 2>/dev/null || echo "")
         if [ -n "$token" ]; then
-            board_job_done --id "$job_id" --token "$token" --verdict "done by $AGENT" >/dev/null 2>&1 \
-                || board_job_fail --id "$job_id" --token "$token" --verdict "failed by $AGENT" >/dev/null 2>&1 \
+            board_job_done --id "$job_id" --token "$token" --agent "$AGENT" --verdict "done by $AGENT" >/dev/null 2>&1 \
+                || board_job_fail --id "$job_id" --token "$token" --agent "$AGENT" --verdict "failed by $AGENT" >/dev/null 2>&1 \
                 || true
         fi
     done <<< "$msgs"

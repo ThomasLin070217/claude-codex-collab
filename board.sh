@@ -40,11 +40,17 @@ has_sqlite3() { command -v sqlite3 >/dev/null 2>&1; }
 # 生成唯一消息 id：msg-<epoch>-<pid>-<random>
 gen_msg_id() { printf 'msg-%s-%s-%s' "$(date +%s)" "$$" "$RANDOM"; }
 
-# SQL 字符串转义（单引号 → 两单引号）。信任边界：本地 agent 协作，非对抗环境。
+# SQL 字符串转义（单引号 → 两单引号）。
+# 注意：bash 3.2（macOS 默认）下 ${s//\'/\'\'} 会错误产生反斜杠，故用变量 q 承载单引号。
 sql_quote() {
-    local s="$1"
-    s="${s//\'/\'\'}"
+    local s="$1" q="'"
+    s="${s//$q/$q$q}"
     printf "'%s'" "$s"
+}
+
+# 校验非负整数（防 SQL 注入：token/seq/priority 等数字字段拼接前必须过这里）
+is_int() {
+    [[ "$1" =~ ^[0-9]+$ ]]
 }
 
 # db：执行写/更新（PRAGMA busy_timeout 更可靠；awk 滤掉其返回值 "5000"）
@@ -151,6 +157,13 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at    INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority);
+
+-- 依赖关系表（精确等值匹配，避免 deps 逗号串的 LIKE 通配符/缺失依赖放行问题）
+CREATE TABLE IF NOT EXISTS job_deps (
+    job_id  TEXT NOT NULL,
+    dep_id  TEXT NOT NULL,
+    PRIMARY KEY (job_id, dep_id)
+);
 SQL
 
     # core.md 模板（文件投影仍保留给人看）
@@ -262,6 +275,7 @@ board_ack() {
         esac
     done
     [ -n "$as" ] && [ -n "$seq" ] || { echo "[board] ack 需要 --as 和 --seq" >&2; return 1; }
+    is_int "$seq" || { echo "[board] ack 的 --seq 必须是非负整数" >&2; return 1; }
 
     board_init
     # 幂等推进：MAX 防回退（重复 ack 无害）
@@ -279,30 +293,31 @@ board_start() {
     local owner="${2:-${BOARD_OWNER:-unknown}}"
     local lease=$(( $(now_epoch) + LEASE_SECONDS ))
 
-    local existing
-    existing=$(dbq "SELECT status FROM tasks WHERE task_id=$(sql_quote "$task_id");" 2>/dev/null || true)
-    if [ -n "$existing" ]; then
-        case "$existing" in
-            running)
-                # 已在运行：幂等返回现有 token
-                dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
-                return 0 ;;
-            done)
-                echo "[board] 拒绝：任务已 done，不可重启（fencing）" >&2; return 1 ;;
-            failed)
-                # 失败允许重试：重置 running，token 递增
-                db "UPDATE tasks SET status='running', fencing_token=fencing_token+1, lease_epoch=$lease,
-                    owner=$(sql_quote "$owner"), pid=$$, updated_at=$(now_epoch)
-                    WHERE task_id=$(sql_quote "$task_id");"
-                dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
-                return 0 ;;
-        esac
-    fi
-
-    # 不存在：INSERT（token=1）
+    # 新任务：INSERT（token=1）；已存在则 DO NOTHING
     db "INSERT INTO tasks(task_id,status,fencing_token,lease_epoch,owner,pid,updated_at)
-        VALUES($(sql_quote "$task_id"),'running',1,$lease,$(sql_quote "$owner"),$$,$(now_epoch));"
-    dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
+        VALUES($(sql_quote "$task_id"),'running',1,$lease,$(sql_quote "$owner"),$$,$(now_epoch))
+        ON CONFLICT(task_id) DO NOTHING;" 2>/dev/null || true
+
+    local status
+    status=$(dbq "SELECT status FROM tasks WHERE task_id=$(sql_quote "$task_id");" 2>/dev/null || echo "")
+
+    case "$status" in
+        running)
+            # 已在运行：幂等返回现有 token
+            dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");"
+            ;;
+        failed)
+            # 失败重试：原子重置 running + token+1（RETURNING，无先查后改竞态）
+            db "UPDATE tasks SET status='running', fencing_token=fencing_token+1, lease_epoch=$lease,
+                owner=$(sql_quote "$owner"), pid=$$, updated_at=$(now_epoch)
+                WHERE task_id=$(sql_quote "$task_id") AND status='failed'
+                RETURNING fencing_token;"
+            ;;
+        done)
+            echo "[board] 拒绝：任务已 done，不可重启（fencing）" >&2; return 1 ;;
+        *)
+            dbq "SELECT fencing_token FROM tasks WHERE task_id=$(sql_quote "$task_id");" ;;
+    esac
 }
 
 # ── claim：抢占孤儿任务（lease 过期 + grace），RETURNING 新 token ──
@@ -345,24 +360,21 @@ board_state() {
 
     [ "$status" = "done" ] || [ "$status" = "failed" ] || { echo "[board] state 状态必须是 done|failed" >&2; return 1; }
 
+    # fencing 必须带 token（去掉宽松分支，防绕过 fencing）
+    is_int "$token" || { echo "[board] state 的 --token 必须是非负整数（fencing 必需）" >&2; return 1; }
+
     board_init
     local now; now=$(now_epoch)
 
-    if [ -n "$token" ]; then
-        # fencing CAS：token 匹配 + 当前 running + lease 未过期（UPDATE + changes() 同连接）
-        local affected
-        affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
-            UPDATE tasks SET status='$status', fencing_token=fencing_token+1, verdict=$(sql_quote "$verdict"), updated_at=$now
-            WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token AND status='running' AND lease_epoch >= $now;
-            SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
-        if [ "$affected" != "1" ]; then
-            echo "[board] fencing 拒绝：token 不匹配或已失权（旧持有者）" >&2
-            return 1
-        fi
-    else
-        # 无 token：宽松提交（兼容旧调用，仅限无竞争场景）
-        db "UPDATE tasks SET status='$status', fencing_token=fencing_token+1, verdict=$(sql_quote "$verdict"), updated_at=$now
-            WHERE task_id=$(sql_quote "$task_id") AND status='running';"
+    # fencing CAS：token 匹配 + 当前 running + lease 未过期（UPDATE + changes() 同连接）
+    local affected
+    affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
+        UPDATE tasks SET status='$status', fencing_token=fencing_token+1, verdict=$(sql_quote "$verdict"), updated_at=$now
+        WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token AND status='running' AND lease_epoch >= $now;
+        SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
+    if [ "$affected" != "1" ]; then
+        echo "[board] fencing 拒绝：token 不匹配或已失权（旧持有者）" >&2
+        return 1
     fi
 }
 
@@ -379,14 +391,10 @@ board_heartbeat() {
         esac
     done
     board_init
+    is_int "$token" || { echo "[board] heartbeat 的 --token 必须是非负整数" >&2; return 1; }
     local lease now; lease=$(( $(now_epoch) + LEASE_SECONDS )); now=$(now_epoch)
-    if [ -n "$token" ]; then
-        db "UPDATE tasks SET lease_epoch=$lease, updated_at=$now
-            WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token AND status='running' AND lease_epoch >= $now;"
-    else
-        db "UPDATE tasks SET lease_epoch=$lease, updated_at=$now
-            WHERE task_id=$(sql_quote "$task_id") AND status='running' AND lease_epoch >= $now;"
-    fi
+    db "UPDATE tasks SET lease_epoch=$lease, updated_at=$now
+        WHERE task_id=$(sql_quote "$task_id") AND fencing_token=$token AND status='running' AND lease_epoch >= $now;"
 }
 
 # ── check：判活（派生 orphaned）────────────────────────────────────
@@ -424,6 +432,9 @@ board_guard() {
     done
 
     board_init
+    if [ -n "$token" ]; then
+        is_int "$token" || { echo "[board] guard 的 --token 必须是非负整数" >&2; return 1; }
+    fi
     local now expired
     now=$(now_epoch)
     expired=$(( now - GRACE_SECONDS ))
@@ -583,22 +594,31 @@ board_job_create() {
         esac
     done
     [ -n "$id" ] && [ -n "$type" ] || { echo "[board] job-create 需要 --id 和 --type" >&2; return 1; }
+    is_int "$priority" || { echo "[board] job-create 的 --priority 必须是非负整数" >&2; return 1; }
     board_init
     db "INSERT INTO jobs(job_id,type,payload,deps,priority) VALUES($(sql_quote "$id"),$(sql_quote "$type"),$(sql_quote "$payload"),$(sql_quote "$deps"),$priority);"
+    # 拆分 deps 写入关系表（精确等值，避免逗号串的 LIKE 通配符问题）
+    if [ -n "$deps" ]; then
+        local d
+        for d in ${deps//,/ }; do
+            [ -n "$d" ] && db "INSERT OR IGNORE INTO job_deps(job_id,dep_id) VALUES($(sql_quote "$id"),$(sql_quote "$d"));" 2>/dev/null || true
+        done
+    fi
 }
 
 # job-ready：把依赖已满足的 pending 标记为 ready（scheduler 调用）
 board_job_ready() {
     board_init
-    # 依赖满足：deps 为空，或 deps 里每个 job_id 都是 done
+    # 依赖满足：job_deps 里每个 dep 都存在（LEFT JOIN 非空）且 status='done'
+    # 缺失依赖 → dj.job_id IS NULL → NOT EXISTS 为 false → 不放行
     db "UPDATE jobs SET status='ready', updated_at=$(now_epoch)
         WHERE status='pending'
-          AND (deps='' OR deps IS NULL
-               OR NOT EXISTS (
-                 SELECT 1 FROM jobs d
-                 WHERE ','||jobs.deps||',' LIKE '%,'||d.job_id||',%'
-                   AND d.status != 'done'
-               ));"
+          AND NOT EXISTS (
+            SELECT 1 FROM job_deps d
+            LEFT JOIN jobs dj ON dj.job_id = d.dep_id
+            WHERE d.job_id = jobs.job_id
+              AND (dj.job_id IS NULL OR dj.status != 'done')
+          );"
     dbq "SELECT job_id FROM jobs WHERE status='ready' ORDER BY priority DESC, created_at ASC;"
 }
 
@@ -625,48 +645,71 @@ board_job_claim() {
 # job-done：完成（fencing CAS）
 # board job-done --id X --token T [--verdict V]
 board_job_done() {
-    local id="" token="" verdict=""
+    local id="" token="" verdict="" agent=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --id) id="$2"; shift 2 ;;
             --token) token="$2"; shift 2 ;;
             --verdict) verdict="$2"; shift 2 ;;
+            --agent) agent="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
     [ -n "$id" ] || { echo "[board] job-done 需要 --id" >&2; return 1; }
+    is_int "$token" || { echo "[board] job-done 的 --token 必须是非负整数" >&2; return 1; }
     board_init
+    local now; now=$(now_epoch)
     local affected
     affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
-        UPDATE jobs SET status='done', verdict=$(sql_quote "$verdict"), updated_at=$(now_epoch)
-        WHERE job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token;
+        UPDATE jobs SET status='done', verdict=$(sql_quote "$verdict"), updated_at=$now
+        WHERE job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token
+          AND COALESCE(lease_epoch,0) >= $now
+          AND (assigned_to=$(sql_quote "$agent") OR $(sql_quote "$agent")='');
         SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
-    [ "$affected" = "1" ] || { echo "[board] job-done 拒绝：token 不匹配" >&2; return 1; }
+    [ "$affected" = "1" ] || { echo "[board] job-done 拒绝：token 不匹配/租约过期/非本人" >&2; return 1; }
 }
 
 # job-fail：失败（attempts+1，超过 max_attempts → dead）——死信机制
 # board job-fail --id X --token T [--verdict V]
 board_job_fail() {
-    local id="" token="" verdict=""
+    local id="" token="" verdict="" agent=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --id) id="$2"; shift 2 ;;
             --token) token="$2"; shift 2 ;;
             --verdict) verdict="$2"; shift 2 ;;
+            --agent) agent="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
     [ -n "$id" ] || { echo "[board] job-fail 需要 --id" >&2; return 1; }
+    is_int "$token" || { echo "[board] job-fail 的 --token 必须是非负整数" >&2; return 1; }
     board_init
+    local now; now=$(now_epoch)
     local affected
     affected=$(sqlite3 -bail "$DB" "PRAGMA busy_timeout=5000;
         UPDATE jobs SET
             attempts=attempts+1,
             status=CASE WHEN attempts+1 >= max_attempts THEN 'dead' ELSE 'pending' END,
-            verdict=$(sql_quote "$verdict"), updated_at=$(now_epoch)
-        WHERE job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token;
+            verdict=$(sql_quote "$verdict"), updated_at=$now
+        WHERE job_id=$(sql_quote "$id") AND status='running' AND fencing_token=$token
+          AND COALESCE(lease_epoch,0) >= $now
+          AND (assigned_to=$(sql_quote "$agent") OR $(sql_quote "$agent")='');
         SELECT changes();" 2>&1 | awk 'NR==1 && $0=="5000" {next} {print}')
-    [ "$affected" = "1" ] || { echo "[board] job-fail 拒绝：token 不匹配" >&2; return 1; }
+    [ "$affected" = "1" ] || { echo "[board] job-fail 拒绝：token 不匹配/租约过期/非本人" >&2; return 1; }
+}
+
+# job-reap：回收 lease 过期的 running（scheduler 每轮调用）
+# 过期 running → attempts+1 → pending（重试）或 dead（超 max）；fencing_token+1 使旧持有者失效
+board_job_reap() {
+    board_init
+    local now; now=$(now_epoch)
+    db "UPDATE jobs SET
+            attempts=attempts+1,
+            status=CASE WHEN attempts+1 >= max_attempts THEN 'dead' ELSE 'pending' END,
+            fencing_token=fencing_token+1,
+            assigned_to=NULL, lease_epoch=NULL, updated_at=$now
+        WHERE status='running' AND COALESCE(lease_epoch,0) < $now;"
 }
 
 # job-list：列 job（可过滤状态）
@@ -726,6 +769,7 @@ board_main() {
         job-claim)  shift; board_job_claim "$@" ;;
         job-done)   shift; board_job_done "$@" ;;
         job-fail)   shift; board_job_fail "$@" ;;
+        job-reap)   shift; board_job_reap "$@" ;;
         job-list)   shift; board_job_list "$@" ;;
         help|"")
             cat <<'HELP'
