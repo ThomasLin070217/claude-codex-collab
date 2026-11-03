@@ -13,6 +13,9 @@ COLLAB_DIR="${COLLAB_DIR:-$HOME/Agent/collab}"
 SPECS_DIR="$COLLAB_DIR/specs"
 OUTPUT_DIR="$COLLAB_DIR/output"
 REPORTS_DIR="$COLLAB_DIR/reports"
+# 租约覆盖同步调用时长（含重试）：2×CODEX_TIMEOUT + 余量 ≈ 1800s
+LEASE_SECONDS="${LEASE_SECONDS:-1800}"
+export LEASE_SECONDS
 
 # 引入黑板总线（同目录 board.sh）；缺失时降级为纯直连（不致命）。
 if [ -f "$SCRIPT_DIR/board.sh" ]; then
@@ -22,6 +25,7 @@ else
     echo "[codex-bridge] 未找到 board.sh，跳过总线集成（仅直连 Codex）" >&2
     board_write() { :; }
     board_state() { :; }
+    board_handoff() { :; }
 fi
 
 # ── Auto-detect Codex CLI ─────────────────────────────────
@@ -150,38 +154,40 @@ run_codex() {
     return $exit_code
 }
 
-# ── Verdict 提取（结构化、机器可读） ──────────────────────
-# 从 Codex stdout 里找 ```json 代码块，尽力提取 decision 字段。
-extract_verdict() {
-    local json
-    json=$(printf '%s' "$CODEX_STDOUT" \
-        | sed -n '/^```json[[:space:]]*$/,/^```[[:space:]]*$/p' \
-        | sed '1d;$d' \
-        | tr -d '\r')
-    [ -z "$json" ] && { echo ""; return 0; }
-    local decision
-    decision=$(printf '%s' "$json" \
-        | grep -o '"decision"[[:space:]]*:[[:space:]]*"[^"]*"' \
-        | head -1 \
-        | sed 's/.*"decision"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-    echo "$decision"
+# ── JSON 提取（jq 优先，降级 sed/grep）────────────────────
+# 从 stdout 提取第一个 ```json ... ``` 块的内容（只取第一个，避免多块拼接后 jq 失败）。
+extract_first_json_block() {
+    printf '%s' "$CODEX_STDOUT" | awk '
+        /^```json[[:space:]]*$/ { inblock=1; next }
+        /^```[[:space:]]*$/ { if (inblock) { inblock=0; exit } }
+        inblock { print }
+    ' | tr -d "\r"
 }
 
-# 从 Codex stdout 提取 ```json handoff 块，返回 JSON 文本（供写交接文件）。
-extract_handoff_json() {
-    printf '%s' "$CODEX_STDOUT" \
-        | sed -n '/^```json[[:space:]]*$/,/^```[[:space:]]*$/p' \
-        | sed '1d;$d' \
-        | tr -d '\r'
-}
-
-# 从 JSON 里尽力提取单个字段值。
+# 从 JSON 里取字段值（jq 优先，处理转义/多行/类型）。
 json_field() {
     local json="$1" key="$2"
-    printf '%s' "$json" \
-        | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
-        | head -1 \
-        | sed "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/"
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$json" | jq -r --arg k "$key" '.[$k] // empty' 2>/dev/null || echo ""
+    else
+        printf '%s' "$json" \
+            | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+            | head -1 \
+            | sed "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/"
+    fi
+}
+
+# 提取 verdict 的 decision 字段。
+extract_verdict() {
+    local json
+    json=$(extract_first_json_block)
+    [ -z "$json" ] && { echo ""; return 0; }
+    json_field "$json" decision
+}
+
+# 提取 handoff JSON 文本（供 json_field 用）。
+extract_handoff_json() {
+    extract_first_json_block
 }
 
 # ── Main ──────────────────────────────────────────────────
